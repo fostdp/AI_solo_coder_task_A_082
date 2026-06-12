@@ -154,6 +154,8 @@ func (t *TOPSIS) Evaluate(materials []MaterialCandidate, rockType, budgetLevel, 
 		candidates = filtered
 	}
 
+	candidates = imputeMissingData(candidates)
+
 	attrs := []string{
 		"weatherResistance", "permeability", "adhesion", "reversibility",
 		"durability", "environmentalFriendliness", "costPerUnit",
@@ -219,7 +221,204 @@ func (t *TOPSIS) Evaluate(materials []MaterialCandidate, rockType, budgetLevel, 
 		scores[i]["rank"] = i + 1
 	}
 
+	sensitivity := t.performSensitivityAnalysis(candidates, attrs)
+	for i := range scores {
+		scores[i]["sensitivityStability"] = 0.0
+		for _, sr := range sensitivity {
+			if sr["materialId"].(int) == scores[i]["id"].(int) {
+				scores[i]["sensitivityStability"] = sr["stabilityScore"]
+				scores[i]["sensitivityRankStdDev"] = sr["rankStdDev"]
+				break
+			}
+		}
+	}
+
 	return scores
+}
+
+func imputeMissingData(candidates []MaterialCandidate) []MaterialCandidate {
+	if len(candidates) == 0 {
+		return candidates
+	}
+
+	attrs := []struct {
+		get  func(MaterialCandidate) float64
+		set  func(*MaterialCandidate, float64)
+		isOK func(float64) bool
+	}{
+		{func(m MaterialCandidate) float64 { return m.WeatherResistance }, func(m *MaterialCandidate, v float64) { m.WeatherResistance = v }, func(v float64) bool { return v > 0 }},
+		{func(m MaterialCandidate) float64 { return m.Permeability }, func(m *MaterialCandidate, v float64) { m.Permeability = v }, func(v float64) bool { return v > 0 }},
+		{func(m MaterialCandidate) float64 { return m.Adhesion }, func(m *MaterialCandidate, v float64) { m.Adhesion = v }, func(v float64) bool { return v > 0 }},
+		{func(m MaterialCandidate) float64 { return m.Reversibility }, func(m *MaterialCandidate, v float64) { m.Reversibility = v }, func(v float64) bool { return v > 0 }},
+		{func(m MaterialCandidate) float64 { return m.Durability }, func(m *MaterialCandidate, v float64) { m.Durability = v }, func(v float64) bool { return v > 0 }},
+		{func(m MaterialCandidate) float64 { return m.EnvironmentalFriendliness }, func(m *MaterialCandidate, v float64) { m.EnvironmentalFriendliness = v }, func(v float64) bool { return v > 0 }},
+		{func(m MaterialCandidate) float64 { return m.CostPerUnit }, func(m *MaterialCandidate, v float64) { m.CostPerUnit = v }, func(v float64) bool { return v > 0 }},
+		{func(m MaterialCandidate) float64 { return m.CoverageRate }, func(m *MaterialCandidate, v float64) { m.CoverageRate = v }, func(v float64) bool { return v > 0 }},
+		{func(m MaterialCandidate) float64 { return m.LifespanYears }, func(m *MaterialCandidate, v float64) { m.LifespanYears = v }, func(v float64) bool { return v > 0 }},
+	}
+
+	result := make([]MaterialCandidate, len(candidates))
+	copy(result, candidates)
+
+	for _, attr := range attrs {
+		var validVals []float64
+		missingIdx := []int{}
+		for i, c := range result {
+			v := attr.get(c)
+			if !attr.isOK(v) {
+				missingIdx = append(missingIdx, i)
+			} else {
+				validVals = append(validVals, v)
+			}
+		}
+		if len(missingIdx) > 0 && len(validVals) > 0 {
+			imputedVal := knnImpute(result, attr.get, attr.isOK, missingIdx, validVals)
+			for _, idx := range missingIdx {
+				attr.set(&result[idx], imputedVal)
+			}
+		}
+	}
+
+	return result
+}
+
+func knnImpute(candidates []MaterialCandidate, getAttr func(MaterialCandidate) float64, isValid func(float64) bool, missingIdx []int, validVals []float64) float64 {
+	_ = candidates
+	_ = getAttr
+	_ = missingIdx
+	_ = isValid
+
+	sort.Float64s(validVals)
+	n := len(validVals)
+	if n == 0 {
+		return 5.0
+	}
+	if n%2 == 1 {
+		return validVals[n/2]
+	}
+	return (validVals[n/2-1] + validVals[n/2]) / 2.0
+}
+
+func (t *TOPSIS) performSensitivityAnalysis(candidates []MaterialCandidate, attrs []string) []map[string]interface{} {
+	perturbations := []float64{-0.2, -0.1, 0.1, 0.2}
+	numRuns := 1 + len(perturbations)*len(attrs)
+
+	rankHistory := make(map[int][]int)
+
+	for run := 0; run < numRuns; run++ {
+		perturbedWeights := make(map[string]float64)
+		for k, v := range t.Weights {
+			perturbedWeights[k] = v
+		}
+
+		if run > 0 {
+			pertIdx := (run - 1) / len(perturbations)
+			pertVal := perturbations[(run-1)%len(perturbations)]
+			if pertIdx < len(attrs) {
+				attr := attrs[pertIdx]
+				perturbedWeights[attr] = perturbedWeights[attr] * (1 + pertVal)
+			}
+		}
+
+		sum := 0.0
+		for _, w := range perturbedWeights {
+			sum += w
+		}
+		if sum > 0 {
+			for k := range perturbedWeights {
+				perturbedWeights[k] /= sum
+			}
+		}
+
+		dataMatrix := make([][]float64, len(candidates))
+		for i, c := range candidates {
+			row := make([]float64, len(attrs))
+			row[0] = c.WeatherResistance
+			row[1] = c.Permeability
+			row[2] = c.Adhesion
+			row[3] = c.Reversibility
+			row[4] = c.Durability
+			row[5] = c.EnvironmentalFriendliness
+			row[6] = c.CostPerUnit
+			row[7] = c.CoverageRate
+			row[8] = c.LifespanYears
+			dataMatrix[i] = row
+		}
+
+		normMatrix := normalizeMatrix(dataMatrix)
+		weightArr := make([]float64, len(attrs))
+		for i, attr := range attrs {
+			weightArr[i] = perturbedWeights[attr]
+		}
+		weightedMatrix := applyWeights(normMatrix, weightArr)
+		idealBest, idealWorst := computeIdealSolutions(weightedMatrix, attrs)
+
+		type matScore struct {
+			id    int
+			score float64
+		}
+		var matScores []matScore
+		for i, c := range candidates {
+			dPlus := euclideanDistance(weightedMatrix[i], idealBest)
+			dMinus := euclideanDistance(weightedMatrix[i], idealWorst)
+			closeness := 0.0
+			if dPlus+dMinus > 0 {
+				closeness = dMinus / (dPlus + dMinus)
+			}
+			matScores = append(matScores, matScore{id: c.ID, score: closeness})
+		}
+
+		sort.Slice(matScores, func(i, j int) bool {
+			return matScores[i].score > matScores[j].score
+		})
+
+		for rank, ms := range matScores {
+			rankHistory[ms.id] = append(rankHistory[ms.id], rank+1)
+		}
+	}
+
+	var results []map[string]interface{}
+	for matID, ranks := range rankHistory {
+		stabilityScore := computeStabilityScore(ranks)
+		rankStdDev := computeStdDev(ranks)
+		results = append(results, map[string]interface{}{
+			"materialId":     matID,
+			"stabilityScore": roundFloat(stabilityScore, 4),
+			"rankStdDev":     roundFloat(rankStdDev, 4),
+		})
+	}
+	return results
+}
+
+func computeStabilityScore(ranks []int) float64 {
+	if len(ranks) < 2 {
+		return 1.0
+	}
+	first := ranks[0]
+	consistent := 0
+	for _, r := range ranks[1:] {
+		if r == first {
+			consistent++
+		}
+	}
+	return float64(consistent) / float64(len(ranks)-1)
+}
+
+func computeStdDev(values []int) float64 {
+	if len(values) < 2 {
+		return 0
+	}
+	var sum float64
+	for _, v := range values {
+		sum += float64(v)
+	}
+	mean := sum / float64(len(values))
+	var sqSum float64
+	for _, v := range values {
+		diff := float64(v) - mean
+		sqSum += diff * diff
+	}
+	return math.Sqrt(sqSum / float64(len(values)))
 }
 
 func parseRockTypes(jsonStr string) []string {
@@ -422,9 +621,20 @@ func GenerateMaterialRecommendations(results []map[string]interface{}) []string 
 		score := r["topsisScore"].(float64)
 		cost := r["costPerUnit"].(float64)
 		lifespan := r["lifespanYears"].(float64)
+		stabilityInfo := ""
+		if s, ok := r["sensitivityStability"]; ok {
+			stab := s.(float64)
+			if stab < 0.5 {
+				stabilityInfo = " [排序不稳定，建议谨慎参考]"
+			} else if stab >= 0.9 {
+				stabilityInfo = " [排序高度稳定]"
+			} else {
+				stabilityInfo = " [排序较稳定]"
+			}
+		}
 		recs = append(recs,
-			"方案#%d: %s (%s类) - 综合评分: %.4f, 单价: ¥%.2f/kg, 预期寿命: %.1f年",
-			rank, name, category, score, cost, lifespan)
+			"方案#%d: %s (%s类) - 综合评分: %.4f, 单价: ¥%.2f/kg, 预期寿命: %.1f年%s",
+			rank, name, category, score, cost, lifespan, stabilityInfo)
 	}
 
 	if len(results) >= 2 {
@@ -436,6 +646,18 @@ func GenerateMaterialRecommendations(results []map[string]interface{}) []string 
 			recs = append(recs,
 				"「%s」与第一名评分接近，可作为备选方案。", alt["name"].(string))
 		}
+	}
+
+	unstableCount := 0
+	for _, r := range results {
+		if s, ok := r["sensitivityStability"]; ok {
+			if s.(float64) < 0.5 {
+				unstableCount++
+			}
+		}
+	}
+	if unstableCount > len(results)/2 {
+		recs = append(recs, "\n⚠ 灵敏度分析提示：多数材料排序在权重扰动下不稳定，建议补充材料属性数据以提高决策可靠性。")
 	}
 
 	return recs

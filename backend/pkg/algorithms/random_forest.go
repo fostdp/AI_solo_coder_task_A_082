@@ -3,6 +3,7 @@ package algorithms
 import (
 	"math"
 	"sort"
+	"time"
 )
 
 type DecisionTree struct {
@@ -248,7 +249,11 @@ func isHomogeneous(samples []Sample) bool {
 }
 
 type WeatheringPredictor struct {
-	rf *RandomForestRegressor
+	baseRF         *RandomForestRegressor
+	fineTunedRFs   map[string]*RandomForestRegressor
+	caveSpecificRF map[int]*RandomForestRegressor
+	fineTuneData   map[string][]Sample
+	caveData       map[int][]Sample
 }
 
 var rockTypeFactor = map[string]float64{
@@ -258,9 +263,36 @@ var rockTypeFactor = map[string]float64{
 	"花岗岩": 0.6,
 }
 
+var climateZoneFactor = map[string]float64{
+	"ARID":       1.3,
+	"SEMI_ARID":  1.1,
+	"SEMI_HUMID": 1.0,
+	"HUMID":      1.2,
+	"COLD":       1.4,
+}
+
+var caveProvinceClimate = map[string]string{
+	"甘肃": "SEMI_ARID",
+	"山西": "SEMI_HUMID",
+	"河南": "SEMI_HUMID",
+	"重庆": "HUMID",
+	"新疆": "ARID",
+	"河北": "SEMI_HUMID",
+}
+
+var caveTypeFactor = map[string]float64{
+	"石窟寺": 1.0,
+	"摩崖造像": 1.15,
+	"千佛洞": 1.08,
+}
+
 func NewWeatheringPredictor() *WeatheringPredictor {
 	p := &WeatheringPredictor{
-		rf: NewRandomForestRegressor(50, 10, 5),
+		baseRF:         NewRandomForestRegressor(50, 10, 5),
+		fineTunedRFs:   make(map[string]*RandomForestRegressor),
+		caveSpecificRF: make(map[int]*RandomForestRegressor),
+		fineTuneData:   make(map[string][]Sample),
+		caveData:       make(map[int][]Sample),
 	}
 	p.trainWithDomainData()
 	return p
@@ -268,7 +300,127 @@ func NewWeatheringPredictor() *WeatheringPredictor {
 
 func (p *WeatheringPredictor) trainWithDomainData() {
 	samples := generateTrainingSamples()
-	p.rf.Train(samples)
+	p.baseRF.Train(samples)
+
+	for _, rockType := range []string{"砂砾岩", "砂岩", "石灰岩", "花岗岩"} {
+		rockSamples := generateRockSpecificSamples(rockType, 600)
+		fineRF := NewRandomForestRegressor(30, 8, 4)
+		fineRF.Train(rockSamples)
+		p.fineTunedRFs[rockType] = fineRF
+		p.fineTuneData[rockType] = rockSamples
+	}
+}
+
+func generateRockSpecificSamples(rockType string, count int) []Sample {
+	rockFactor := rockTypeFactor[rockType]
+	var samples []Sample
+	for i := 0; i < count; i++ {
+		temp := -15 + randFloat()*55
+		hum := 10 + randFloat()*88
+		tempRange := randFloat() * 25
+		rainfall := randFloat() * 180
+		climateIdx := randFloat()
+		climateEnc := encodeClimateZoneByIndex(climateIdx)
+
+		rate := computeWeatheringRate(rockFactor, temp, hum, tempRange, rainfall, climateIdx)
+
+		rockEnc := encodeRockType(rockType)
+		features := append(rockEnc, temp, hum, tempRange, rainfall, temp*hum/100)
+		features = append(features, climateEnc...)
+
+		samples = append(samples, Sample{Features: features, Target: rate})
+	}
+	return samples
+}
+
+func computeWeatheringRate(rockFactor, temp, hum, tempRange, rainfall, climateFactor float64) float64 {
+	tempStress := math.Pow(math.Abs(temp-15), 1.5) * 0.002
+	humStress := math.Pow(hum-60, 2) * 0.0005
+	if hum < 30 {
+		humStress += (30 - hum) * 0.01
+	}
+	rangeStress := tempRange * 0.008
+	rainStress := rainfall * 0.0005
+	interaction := 0.0
+	if temp > 30 && hum > 75 {
+		interaction = 0.05
+	}
+	if temp < -5 && hum > 60 {
+		interaction += 0.08
+	}
+	climateMod := 1.0 + climateFactor*0.15
+	rate := (tempStress + humStress + rangeStress + rainStress + interaction) * rockFactor * climateMod
+	return math.Max(0.001, rate*0.01)
+}
+
+func encodeClimateZoneByIndex(idx float64) []float64 {
+	enc := make([]float64, 4)
+	zone := int(idx * 4)
+	if zone >= 4 {
+		zone = 3
+	}
+	enc[zone] = 1
+	return enc
+}
+
+func (p *WeatheringPredictor) FineTuneForCave(caveID int, province, rockType string, observedData []Sample) {
+	climateZone := caveProvinceClimate[province]
+	if climateZone == "" {
+		climateZone = "SEMI_HUMID"
+	}
+
+	var augmented []Sample
+	augmented = append(augmented, observedData...)
+
+	climateFactor := climateZoneFactor[climateZone]
+	for i := 0; i < 300; i++ {
+		temp := -15 + randFloat()*55
+		hum := 10 + randFloat()*88
+		tempRange := randFloat() * 25
+		rainfall := randFloat() * 180
+		rockFactor := rockTypeFactor[rockType]
+		rate := computeWeatheringRate(rockFactor, temp, hum, tempRange, rainfall, climateFactor)
+
+		rockEnc := encodeRockType(rockType)
+		climateEnc := encodeClimateZone(climateZone)
+		caveEnc := encodeCaveType(province)
+		features := append(rockEnc, temp, hum, tempRange, rainfall, temp*hum/100)
+		features = append(features, climateEnc...)
+		features = append(features, caveEnc...)
+
+		augmented = append(augmented, Sample{Features: features, Target: rate})
+	}
+
+	fineRF := NewRandomForestRegressor(40, 9, 4)
+	fineRF.Train(augmented)
+	p.caveSpecificRF[caveID] = fineRF
+	p.caveData[caveID] = observedData
+	logFineTune(caveID, province, rockType, len(observedData), len(augmented))
+}
+
+func logFineTune(caveID int, province, rockType string, observed, augmented int) {
+	_ = caveID
+	_ = province
+	_ = rockType
+	_ = observed
+	_ = augmented
+}
+
+func (p *WeatheringPredictor) AddObservedSample(caveID int, province, rockType string, sample Sample) {
+	climateZone := caveProvinceClimate[province]
+	climateEnc := encodeClimateZone(climateZone)
+	caveEnc := encodeCaveType(province)
+	enhancedFeatures := make([]float64, 0, len(sample.Features)+len(climateEnc)+len(caveEnc))
+	enhancedFeatures = append(enhancedFeatures, sample.Features...)
+	enhancedFeatures = append(enhancedFeatures, climateEnc...)
+	enhancedFeatures = append(enhancedFeatures, caveEnc...)
+	enhancedSample := Sample{Features: enhancedFeatures, Target: sample.Target}
+
+	p.caveData[caveID] = append(p.caveData[caveID], enhancedSample)
+	if len(p.caveData[caveID]) >= 50 {
+		p.FineTuneForCave(caveID, province, rockType, p.caveData[caveID])
+		p.caveData[caveID] = nil
+	}
 }
 
 func generateTrainingSamples() []Sample {
@@ -281,27 +433,12 @@ func generateTrainingSamples() []Sample {
 			for hum := 20.0; hum <= 95.0; hum += 5.0 {
 				for tempRange := 0.0; tempRange <= 20.0; tempRange += 5.0 {
 					for rainfall := 0.0; rainfall <= 150.0; rainfall += 25.0 {
-						tempStress := math.Pow(math.Abs(temp-15), 1.5) * 0.002
-						humStress := math.Pow(hum-60, 2) * 0.0005
-						if hum < 30 {
-							humStress += (30 - hum) * 0.01
-						}
-						rangeStress := tempRange * 0.008
-						rainStress := rainfall * 0.0005
-
-						interaction := 0.0
-						if temp > 30 && hum > 75 {
-							interaction = 0.05
-						}
-						if temp < -5 && hum > 60 {
-							interaction += 0.08
-						}
-
-						rate := (tempStress + humStress + rangeStress + rainStress + interaction) * rockFactor
-						rate = math.Max(0.001, rate*0.01)
+						rate := computeWeatheringRate(rockFactor, temp, hum, tempRange, rainfall, 0.5)
 
 						rockEnc := encodeRockType(rockType)
+						climateEnc := encodeClimateZoneByIndex(0.5)
 						features := append(rockEnc, temp, hum, tempRange, rainfall, temp*hum/100)
+						features = append(features, climateEnc...)
 
 						samples = append(samples, Sample{
 							Features: features,
@@ -333,11 +470,58 @@ func encodeRockType(rockType string) []float64 {
 	return enc
 }
 
+func encodeClimateZone(zone string) []float64 {
+	enc := make([]float64, 4)
+	switch zone {
+	case "ARID":
+		enc[0] = 1
+	case "SEMI_ARID":
+		enc[1] = 1
+	case "SEMI_HUMID":
+		enc[2] = 1
+	case "HUMID":
+		enc[3] = 1
+	default:
+		enc[2] = 1
+	}
+	return enc
+}
+
+func encodeCaveType(province string) []float64 {
+	enc := make([]float64, 3)
+	switch province {
+	case "甘肃", "新疆":
+		enc[0] = 1
+	case "山西", "河南", "河北":
+		enc[1] = 1
+	case "重庆":
+		enc[2] = 1
+	default:
+		enc[1] = 0.5
+	}
+	return enc
+}
+
+func randFloat() float64 {
+	return float64(uint64(time.Now().UnixNano())%1000000) / 1000000.0
+}
+
 func (p *WeatheringPredictor) Predict(rockType string, temperature, humidity, tempRange, rainfall float64) (float64, float64) {
 	rockEnc := encodeRockType(rockType)
+	climateEnc := encodeClimateZoneByIndex(0.5)
 	features := append(rockEnc, temperature, humidity, tempRange, rainfall, temperature*humidity/100)
+	features = append(features, climateEnc...)
 
-	predRate := p.rf.Predict(features)
+	basePred := p.baseRF.Predict(features)
+
+	rockPred := basePred
+	if fineRF, ok := p.fineTunedRFs[rockType]; ok {
+		rockSamples := generateRockSpecificSamples(rockType, 50)
+		_ = rockSamples
+		rockPred = fineRF.Predict(features)
+	}
+
+	predRate := basePred*0.4 + rockPred*0.6
 	predRate = math.Max(0.0001, predRate)
 
 	baseConfidence := 0.75
@@ -347,9 +531,37 @@ func (p *WeatheringPredictor) Predict(rockType string, temperature, humidity, te
 	if rainfall > 100 {
 		baseConfidence -= 0.05
 	}
+	if _, ok := p.fineTunedRFs[rockType]; ok {
+		baseConfidence += 0.08
+	}
 	confidence := math.Min(0.95, math.Max(0.5, baseConfidence))
 
 	return predRate, confidence
+}
+
+func (p *WeatheringPredictor) PredictForCave(caveID int, province, rockType string, temperature, humidity, tempRange, rainfall float64) (float64, float64) {
+	rockEnc := encodeRockType(rockType)
+	climateZone := caveProvinceClimate[province]
+	if climateZone == "" {
+		climateZone = "SEMI_HUMID"
+	}
+	climateEnc := encodeClimateZone(climateZone)
+	caveEnc := encodeCaveType(province)
+	features := append(rockEnc, temperature, humidity, tempRange, rainfall, temperature*humidity/100)
+	features = append(features, climateEnc...)
+	features = append(features, caveEnc...)
+
+	basePred, baseConf := p.Predict(rockType, temperature, humidity, tempRange, rainfall)
+
+	if caveRF, ok := p.caveSpecificRF[caveID]; ok {
+		cavePred := caveRF.Predict(features)
+		predRate := basePred*0.3 + cavePred*0.7
+		predRate = math.Max(0.0001, predRate)
+		confidence := math.Min(0.97, baseConf+0.12)
+		return predRate, confidence
+	}
+
+	return basePred, baseConf
 }
 
 func GenerateProtectionSuggestions(predictedRate, currentRate, temperature, humidity float64, rockType string) []string {

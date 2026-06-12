@@ -518,13 +518,22 @@ func (h *Handler) PredictWeathering(c *gin.Context) {
 
 	predRate, confidence := h.weatheringPred.Predict(rockType, *targetTemp, *targetHum, *tempRange, historicalAvgRainfall)
 
+	cave, _ := h.caveSvc.GetByID(ctx, point.CaveID)
+	if cave != nil {
+		predRateCave, confCave := h.weatheringPred.PredictForCave(cave.ID, cave.Province, rockType, *targetTemp, *targetHum, *tempRange, historicalAvgRainfall)
+		if confCave > confidence {
+			predRate = predRateCave
+			confidence = confCave
+		}
+	}
+
 	currentRate := h.calculateCurrentWeatheringRate(ctx, req.PointID)
 
 	suggestions := algorithms.GenerateProtectionSuggestions(predRate, currentRate, *targetTemp, *targetHum, rockType)
 
 	prediction := &models.WeatheringPrediction{
 		PointID:               req.PointID,
-		ModelVersion:          "RF-v1.0",
+		ModelVersion:          "RF-v2.0-transfer",
 		InputTemperature:      *targetTemp,
 		InputHumidity:         *targetHum,
 		InputTemperatureRange: *tempRange,
@@ -677,7 +686,20 @@ func (h *Handler) WebSocketEndpoint(c *gin.Context) {
 
 func (h *Handler) WSStatus(c *gin.Context) {
 	h.respondJSON(c, http.StatusOK, models.SuccessResponse(map[string]interface{}{
-		"connectedClients": h.wsManager.ClientCount(),
+		"connectedClients":   h.wsManager.ClientCount(),
+		"offlineMessageCount": h.wsManager.OfflineMessageCount(),
+	}))
+}
+
+func (h *Handler) GetOfflineMessages(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	messages := h.wsManager.GetPendingOfflineMessages(limit)
+	h.respondJSON(c, http.StatusOK, models.SuccessResponse(map[string]interface{}{
+		"count":    len(messages),
+		"messages": messages,
 	}))
 }
 

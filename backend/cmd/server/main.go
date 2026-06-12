@@ -127,6 +127,7 @@ func setupRoutes(r *gin.Engine, h *handlers.Handler) {
 		{
 			ws.GET("", h.WebSocketEndpoint)
 			ws.GET("/status", h.WSStatus)
+			ws.GET("/offline-messages", h.GetOfflineMessages)
 		}
 	}
 

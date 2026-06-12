@@ -2,6 +2,17 @@
   <div class="grotto-3d-container" ref="containerRef">
     <canvas ref="canvasRef" class="three-canvas" />
 
+    <div class="loading-overlay" v-if="loadingState.phase !== 'complete' && loadingState.phase !== 'idle'">
+      <div class="loading-content">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">{{ loadingState.phase === 'skeleton' ? '加载骨架...' : '加载细节...' }}</div>
+        <div class="loading-bar">
+          <div class="loading-bar-fill" :style="{ width: loadingState.progress + '%' }"></div>
+        </div>
+        <div class="loading-detail">LOD 级别: {{ loadingState.detailLevel }} / 3</div>
+      </div>
+    </div>
+
     <div class="controls-panel">
       <div class="control-group">
         <div class="control-label">显示选项</div>
@@ -68,6 +79,11 @@ const camera = shallowRef(null);
 const renderer = shallowRef(null);
 const controls = shallowRef(null);
 let animationId = null;
+const loadingState = reactive({
+ phase: 'idle',
+ progress: 0,
+ detailLevel: 0
+});
 const objects = reactive({
  caveGroup: null,
  pointsGroup: null,
@@ -115,9 +131,205 @@ function initThree() {
  controls.value.maxPolarAngle = Math.PI / 2 + 0.1;
  controls.value.target.set(0, 10, 0);
  addLights();
- createCaveModel();
  createGround();
  animate();
+ progressiveLoad();
+}
+async function progressiveLoad() {
+ loadingState.phase = 'skeleton';
+ loadingState.progress = 0;
+ createCaveSkeleton();
+ await yieldFrame();
+ loadingState.phase = 'detail';
+ loadingState.progress = 30;
+ await loadDetailLevel1();
+ loadingState.progress = 60;
+ await loadDetailLevel2();
+ loadingState.progress = 90;
+ await loadDetailLevel3();
+ loadingState.progress = 100;
+ loadingState.phase = 'complete';
+ loadingState.detailLevel = 3;
+ createOrUpdatePoints();
+ createOrUpdateHeatmap();
+ createOrUpdateCracks();
+}
+function yieldFrame() {
+ return new Promise(resolve => requestAnimationFrame(resolve));
+}
+function createCaveSkeleton() {
+ objects.caveGroup = new THREE.Group();
+ const skeletonMat = new THREE.MeshBasicMaterial({
+ color: 0x5a4a3a,
+ wireframe: true,
+ transparent: true,
+ opacity: 0.3
+ });
+ const mainGeo = new THREE.SphereGeometry(55, 6, 4);
+ const mainHill = new THREE.Mesh(mainGeo, skeletonMat);
+ mainHill.position.y = 10;
+ objects.caveGroup.add(mainHill);
+ for (let i = 0; i < 7; i++) {
+  const angle = (i / 7) * Math.PI * 2 + 0.3;
+  const dist = 45 + 12;
+  const hillGeo = new THREE.SphereGeometry(18, 4, 3);
+  const hill = new THREE.Mesh(hillGeo, skeletonMat);
+  hill.position.set(Math.cos(angle) * dist, 8, Math.sin(angle) * dist);
+  objects.caveGroup.add(hill);
+ }
+ scene.value.add(objects.caveGroup);
+}
+async function loadDetailLevel1() {
+ if (!objects.caveGroup) return;
+ clearCaveGroup();
+ const rockMat = new THREE.MeshStandardMaterial({
+ color: 0x8b7355,
+ roughness: 0.9,
+ metalness: 0.05,
+ flatShading: true
+ });
+ const mainHillGeo = new THREE.SphereGeometry(55, 10, 8);
+ const positions = mainHillGeo.attributes.position;
+ for (let i = 0; i < positions.count; i++) {
+  const x = positions.getX(i), y = positions.getY(i), z = positions.getZ(i);
+  const noise1 = Math.sin(x * 0.08) * Math.cos(z * 0.09) * 8;
+  const noise2 = Math.sin(y * 0.1 + x * 0.05) * 5;
+  const flatten = y < 0 ? -y * 0.9 : 0;
+  positions.setXYZ(i, x + noise1, y * 0.72 + noise2 + flatten, z + noise1 * 0.7);
+ }
+ positions.needsUpdate = true;
+ mainHillGeo.computeVertexNormals();
+ const mainHill = new THREE.Mesh(mainHillGeo, rockMat);
+ mainHill.position.y = 10;
+ mainHill.castShadow = true;
+ mainHill.receiveShadow = true;
+ mainHill.userData.lodLevel = 1;
+ objects.caveGroup.add(mainHill);
+ for (let i = 0; i < 7; i++) {
+  const angle = (i / 7) * Math.PI * 2 + 0.3;
+  const dist = 45 + Math.random() * 15;
+  const hillGeo = new THREE.SphereGeometry(18 + Math.random() * 12, 8, 6);
+  const pos2 = hillGeo.attributes.position;
+  for (let j = 0; j < pos2.count; j++) {
+   const x = pos2.getX(j), y = pos2.getY(j), z = pos2.getZ(j);
+   const n = Math.sin(x * 0.15) * Math.cos(z * 0.12) * 3;
+   const flat = y < 0 ? -y * 0.95 : 0;
+   pos2.setXYZ(j, x + n, y * 0.55 + n * 0.3 + flat, z + n * 0.8);
+  }
+  pos2.needsUpdate = true;
+  hillGeo.computeVertexNormals();
+  const hill = new THREE.Mesh(hillGeo, rockMat);
+  hill.position.set(Math.cos(angle) * dist, 6 + Math.random() * 4, Math.sin(angle) * dist);
+  hill.castShadow = true;
+  hill.receiveShadow = true;
+  hill.userData.lodLevel = 1;
+  objects.caveGroup.add(hill);
+ }
+ scene.value.add(objects.caveGroup);
+ await yieldFrame();
+}
+async function loadDetailLevel2() {
+ if (!objects.caveGroup) return;
+ const rockMatDark = new THREE.MeshStandardMaterial({
+  color: 0x6b5344,
+  roughness: 0.95,
+  metalness: 0.0,
+  flatShading: true
+ });
+ const nichePositions = [];
+ for (let i = 0; i < 12; i++) {
+  const angle = (i / 12) * Math.PI * 2 + 0.2;
+  const dist = 28 + Math.random() * 18;
+  const nx = Math.cos(angle) * dist;
+  const nz = Math.sin(angle) * dist;
+  nichePositions.push({ angle, dist, nx, nz });
+ }
+ for (let batch = 0; batch < 4; batch++) {
+  const start = batch * 3;
+  const end = Math.min(start + 3, nichePositions.length);
+  for (let i = start; i < end; i++) {
+   const { nx, nz } = nichePositions[i];
+   const nicheDepth = 4 + Math.random() * 4;
+   const nicheWidth = 5 + Math.random() * 4;
+   const nicheHeight = 7 + Math.random() * 5;
+   const nicheGeo = new THREE.SphereGeometry(nicheWidth, 6, 4);
+   const nichePos = nicheGeo.attributes.position;
+   for (let j = 0; j < nichePos.count; j++) {
+    let x = nichePos.getX(j), y = nichePos.getY(j), z = nichePos.getZ(j);
+    if (z > 0) { z *= 0.2; }
+    nichePos.setXYZ(j, x, y * (nicheHeight / nicheWidth), z * (nicheDepth / nicheWidth));
+   }
+   nichePos.needsUpdate = true;
+   nicheGeo.computeVertexNormals();
+   const nicheMat = new THREE.MeshStandardMaterial({
+    color: 0x1a1410,
+    roughness: 1.0,
+    side: THREE.BackSide
+   });
+   const niche = new THREE.Mesh(nicheGeo, nicheMat);
+   niche.position.set(nx, 8 + Math.random() * 15, nz);
+   niche.lookAt(0, niche.position.y, 0);
+   niche.rotateY(Math.PI);
+   niche.userData.lodLevel = 2;
+   objects.caveGroup.add(niche);
+  }
+  await yieldFrame();
+ }
+ for (let i = 0; i < 4; i++) {
+  const pillarGeo = new THREE.CylinderGeometry(1.8, 2.5, 28 + Math.random() * 12, 6);
+  const pillar = new THREE.Mesh(pillarGeo, rockMatDark);
+  const angle = (i / 4) * Math.PI * 2 + 0.7;
+  pillar.position.set(Math.cos(angle) * 35, 18, Math.sin(angle) * 35);
+  pillar.castShadow = true;
+  pillar.receiveShadow = true;
+  pillar.userData.lodLevel = 2;
+  objects.caveGroup.add(pillar);
+ }
+}
+async function loadDetailLevel3() {
+ if (!objects.caveGroup) return;
+ const lod1Meshes = [];
+ objects.caveGroup.traverse(obj => {
+  if (obj.isMesh && obj.userData.lodLevel === 1) {
+   lod1Meshes.push(obj);
+  }
+ });
+ for (const mesh of lod1Meshes) {
+  const oldGeo = mesh.geometry;
+  const baseParams = oldGeo.parameters || {};
+  const newWidthSegs = Math.min((baseParams.widthSegments || 10) * 2, 32);
+  const newHeightSegs = Math.min((baseParams.heightSegments || 8) * 2, 24);
+  const newGeo = new THREE.SphereGeometry(
+   baseParams.radius || 55,
+   newWidthSegs,
+   newHeightSegs
+  );
+  const positions = newGeo.attributes.position;
+  for (let i = 0; i < positions.count; i++) {
+   const x = positions.getX(i), y = positions.getY(i), z = positions.getZ(i);
+   const noise1 = Math.sin(x * 0.08) * Math.cos(z * 0.09) * 8;
+   const noise2 = Math.sin(y * 0.1 + x * 0.05) * 5;
+   const noise3 = Math.sin(x * 0.17 + z * 0.13) * 2.5;
+   const flatten = y < 0 ? -y * 0.9 : 0;
+   positions.setXYZ(i, x + noise1 + noise3 * 0.3, y * 0.72 + noise2 + flatten, z + noise1 * 0.7 + noise3 * 0.2);
+  }
+  positions.needsUpdate = true;
+  newGeo.computeVertexNormals();
+  mesh.geometry.dispose();
+  mesh.geometry = newGeo;
+  mesh.userData.lodLevel = 3;
+  await yieldFrame();
+ }
+}
+function clearCaveGroup() {
+ if (!objects.caveGroup) return;
+ objects.caveGroup.traverse(obj => {
+  obj.geometry?.dispose?.();
+  if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+  else obj.material?.dispose?.();
+ });
+ scene.value.remove(objects.caveGroup);
+ objects.caveGroup = new THREE.Group();
 }
 function addLights() {
  const ambient = new THREE.AmbientLight(0x404a5c, 0.6);
@@ -154,101 +366,6 @@ function createGround() {
  const gridHelper = new THREE.GridHelper(240, 60, 0x334155, 0x1e293b);
  gridHelper.position.y = 0.01;
  scene.value.add(gridHelper);
-}
-function createCaveModel() {
- objects.caveGroup = new THREE.Group();
- const rockMat = new THREE.MeshStandardMaterial({
- color: 0x8b7355,
- roughness: 0.9,
- metalness: 0.05,
- flatShading: true
- });
- const rockMatDark = new THREE.MeshStandardMaterial({
- color: 0x6b5344,
- roughness: 0.95,
- metalness: 0.0,
- flatShading: true
- });
- const mainHillGeo = new THREE.SphereGeometry(55, 16, 12);
- const positions = mainHillGeo.attributes.position;
- for (let i = 0; i < positions.count; i++) {
- const x = positions.getX(i);
- const y = positions.getY(i);
- const z = positions.getZ(i);
- const noise1 = Math.sin(x * 0.08) * Math.cos(z * 0.09) * 8;
- const noise2 = Math.sin(y * 0.1 + x * 0.05) * 5;
- const flatten = y < 0 ? -y * 0.9 : 0;
- positions.setXYZ(i, x + noise1, y * 0.72 + noise2 + flatten, z + noise1 * 0.7);
- }
- positions.needsUpdate = true;
- mainHillGeo.computeVertexNormals();
- const mainHill = new THREE.Mesh(mainHillGeo, rockMat);
- mainHill.position.y = 10;
- mainHill.castShadow = true;
- mainHill.receiveShadow = true;
- objects.caveGroup.add(mainHill);
- for (let i = 0; i < 7; i++) {
- const angle = (i / 7) * Math.PI * 2 + 0.3;
- const dist = 45 + Math.random() * 15;
- const hx = Math.cos(angle) * dist;
- const hz = Math.sin(angle) * dist;
- const hillGeo = new THREE.SphereGeometry(18 + Math.random() * 12, 10, 8);
- const pos2 = hillGeo.attributes.position;
- for (let j = 0; j < pos2.count; j++) {
- const x = pos2.getX(j), y = pos2.getY(j), z = pos2.getZ(j);
- const n = Math.sin(x * 0.15) * Math.cos(z * 0.12) * 3;
- const flat = y < 0 ? -y * 0.95 : 0;
- pos2.setXYZ(j, x + n, y * 0.55 + n * 0.3 + flat, z + n * 0.8);
- }
- pos2.needsUpdate = true;
- hillGeo.computeVertexNormals();
- const hill = new THREE.Mesh(hillGeo, Math.random() > 0.5 ? rockMat : rockMatDark);
- hill.position.set(hx, 6 + Math.random() * 4, hz);
- hill.castShadow = true;
- hill.receiveShadow = true;
- objects.caveGroup.add(hill);
- }
- for (let i = 0; i < 12; i++) {
- const angle = (i / 12) * Math.PI * 2 + 0.2;
- const dist = 28 + Math.random() * 18;
- const nx = Math.cos(angle) * dist;
- const nz = Math.sin(angle) * dist;
- const nicheDepth = 4 + Math.random() * 4;
- const nicheWidth = 5 + Math.random() * 4;
- const nicheHeight = 7 + Math.random() * 5;
- const nicheGeo = new THREE.SphereGeometry(nicheWidth, 8, 6);
- const nichePos = nicheGeo.attributes.position;
- for (let j = 0; j < nichePos.count; j++) {
- let x = nichePos.getX(j), y = nichePos.getY(j), z = nichePos.getZ(j);
- if (z > 0) {
- z *= 0.2;
- x *= 1.0;
- }
- nichePos.setXYZ(j, x, y * (nicheHeight / nicheWidth), z * (nicheDepth / nicheWidth));
- }
- nichePos.needsUpdate = true;
- nicheGeo.computeVertexNormals();
- const nicheMat = new THREE.MeshStandardMaterial({
- color: 0x1a1410,
- roughness: 1.0,
- side: THREE.BackSide
- });
- const niche = new THREE.Mesh(nicheGeo, nicheMat);
- niche.position.set(nx, 8 + Math.random() * 15, nz);
- niche.lookAt(0, niche.position.y, 0);
- niche.rotateY(Math.PI);
- objects.caveGroup.add(niche);
- }
- for (let i = 0; i < 4; i++) {
- const pillarGeo = new THREE.CylinderGeometry(1.8, 2.5, 28 + Math.random() * 12, 8);
- const pillar = new THREE.Mesh(pillarGeo, rockMatDark);
- const angle = (i / 4) * Math.PI * 2 + 0.7;
- pillar.position.set(Math.cos(angle) * 35, 18, Math.sin(angle) * 35);
- pillar.castShadow = true;
- pillar.receiveShadow = true;
- objects.caveGroup.add(pillar);
- }
- scene.value.add(objects.caveGroup);
 }
 function getPointStatus(pt) {
  const sensor = props.sensorData.find(s => s.pointId === pt.id);
@@ -339,17 +456,21 @@ function createOrUpdateHeatmap() {
  if (score < 5) return;
  const normalized = Math.min(1, score / 60);
  const canvas = document.createElement('canvas');
- canvas.width = 128; canvas.height = 128;
+  const texSize = Math.max(32, Math.min(128, Math.round(64 + score * 0.6)));
+  canvas.width = texSize; canvas.height = texSize;
  const ctx = canvas.getContext('2d');
- const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+ const half = texSize / 2;
+ const grad = ctx.createRadialGradient(half, half, 0, half, half, half);
  grad.addColorStop(0, `rgba(239,68,68,${0.6 * normalized})`);
  grad.addColorStop(0.35, `rgba(245,158,11,${0.45 * normalized})`);
  grad.addColorStop(0.65, `rgba(59,130,246,${0.25 * normalized})`);
  grad.addColorStop(1, 'rgba(16,185,129,0)');
  ctx.fillStyle = grad;
- ctx.fillRect(0, 0, 128, 128);
+ ctx.fillRect(0, 0, texSize, texSize);
  const texture = new THREE.CanvasTexture(canvas);
- texture.needsUpdate = true;
+ texture.generateMipmaps = false;
+ texture.minFilter = THREE.LinearFilter;
+ texture.magFilter = THREE.LinearFilter;
  const planeGeo = new THREE.PlaneGeometry(20 + score * 0.4, 20 + score * 0.4);
  const planeMat = new THREE.MeshBasicMaterial({
  map: texture,
@@ -504,9 +625,6 @@ let ro = null;
 onMounted(() => {
  nextTick(() => {
  initThree();
- createOrUpdatePoints();
- createOrUpdateHeatmap();
- createOrUpdateCracks();
  containerRef.value.addEventListener('click', handleClick);
  ro = new ResizeObserver(handleResize);
  ro.observe(containerRef.value);
@@ -528,6 +646,61 @@ onBeforeUnmount(() => {
   border-radius: 10px;
   overflow: hidden;
   background: linear-gradient(180deg, #0a0f1a 0%, #020617 100%);
+
+  .loading-overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    z-index: 20;
+    background: rgba(2, 6, 23, 0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(4px);
+
+    .loading-content {
+      text-align: center;
+
+      .loading-spinner {
+        width: 40px; height: 40px;
+        border: 3px solid rgba(212,175,55,0.2);
+        border-top-color: #d4af37;
+        border-radius: 50%;
+        margin: 0 auto 14px;
+        animation: spin 0.8s linear infinite;
+      }
+
+      .loading-text {
+        font-size: 14px;
+        color: #e2e8f0;
+        margin-bottom: 10px;
+      }
+
+      .loading-bar {
+        width: 200px;
+        height: 4px;
+        background: rgba(255,255,255,0.1);
+        border-radius: 2px;
+        margin: 0 auto 8px;
+        overflow: hidden;
+
+        .loading-bar-fill {
+          height: 100%;
+          background: linear-gradient(90deg, #d4af37, #f59e0b);
+          border-radius: 2px;
+          transition: width 0.3s ease;
+        }
+      }
+
+      .loading-detail {
+        font-size: 11px;
+        color: #64748b;
+      }
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  }
 
   .three-canvas {
     width: 100% !important;

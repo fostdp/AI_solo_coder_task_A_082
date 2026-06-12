@@ -56,11 +56,22 @@ function setupEventHandlers() {
 function handleMessage(msg) {
   const store = useMainStore()
 
-  switch (msg.type) {
+  const isOffline = msg.type.startsWith('OFFLINE_')
+  const actualType = isOffline ? msg.type.replace('OFFLINE_', '') : msg.type
+
+  if (msg.id) {
+    sendAck(msg.id)
+  }
+
+  switch (actualType) {
     case 'ALERT':
       const alert = msg.payload
       store.addAlert(alert)
-      showAlertNotification(alert)
+      if (isOffline) {
+        showOfflineAlertNotification(alert)
+      } else {
+        showAlertNotification(alert)
+      }
       break
     case 'SENSOR_DATA':
       store.updateSensorData(msg.payload)
@@ -69,6 +80,32 @@ function handleMessage(msg) {
       console.log('[WS Status]', msg.payload)
       break
   }
+}
+
+function sendAck(msgId) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'ACK', msgId }))
+  }
+}
+
+function showOfflineAlertNotification(alert) {
+  const typeMap = {
+    'CRITICAL': { type: 'error', duration: 15000 },
+    'WARNING':  { type: 'warning', duration: 12000 },
+    'INFO':     { type: 'info', duration: 8000 }
+  }
+  const cfg = typeMap[alert.severity] || typeMap['INFO']
+
+  ElNotification({
+    title: `📬 离线消息: ${alert.title}`,
+    message: alert.message + ' (离线期间产生)',
+    type: cfg.type,
+    duration: cfg.duration,
+    offset: 80,
+    onClick: () => {
+      window.location.hash = '#/alerts'
+    }
+  })
 }
 
 function showAlertNotification(alert) {

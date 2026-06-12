@@ -164,7 +164,7 @@ import {
   Slides, MagicStick, DataLine, Odometer, Cpu, ChatLineRound
 } from '@element-plus/icons-vue'
 import { weatheringApi } from '@/api'
-import algorithms from '@/pkg/algorithms/random_forest.go'
+
 
 use([
   CanvasRenderer, LineChart, BarChart, HeatmapChart,
