@@ -1,0 +1,442 @@
+package algorithms
+
+import (
+	"encoding/json"
+	"math"
+	"sort"
+)
+
+type TOPSIS struct {
+	Weights         map[string]float64
+	BenefitAttrs    map[string]bool
+	AlternativeData []map[string]float64
+	AlternativeIDs  []int
+	AlternativeNames []string
+}
+
+func NewTOPSIS() *TOPSIS {
+	return &TOPSIS{
+		Weights: map[string]float64{
+			"weatherResistance":        0.20,
+			"permeability":             0.15,
+			"adhesion":                 0.10,
+			"reversibility":            0.12,
+			"durability":               0.15,
+			"environmentalFriendliness": 0.10,
+			"costPerUnit":              0.10,
+			"coverageRate":             0.05,
+			"lifespanYears":            0.03,
+		},
+		BenefitAttrs: map[string]bool{
+			"weatherResistance":         true,
+			"permeability":              true,
+			"adhesion":                  true,
+			"reversibility":             true,
+			"durability":                true,
+			"environmentalFriendliness": true,
+			"coverageRate":              true,
+			"lifespanYears":             true,
+			"costPerUnit":              false,
+		},
+	}
+}
+
+func (t *TOPSIS) SetWeights(weights map[string]float64) {
+	sum := 0.0
+	for _, w := range weights {
+		sum += w
+	}
+	if sum > 0 {
+		normalized := make(map[string]float64)
+		for k, w := range weights {
+			normalized[k] = w / sum
+		}
+		t.Weights = normalized
+	}
+}
+
+func (t *TOPSIS) ApplyPriorityCriteria(criteria []string) {
+	baseWeights := map[string]float64{
+		"weatherResistance":         0.20,
+		"permeability":              0.15,
+		"adhesion":                  0.10,
+		"reversibility":             0.12,
+		"durability":                0.15,
+		"environmentalFriendliness": 0.10,
+		"costPerUnit":               0.10,
+		"coverageRate":              0.05,
+		"lifespanYears":             0.03,
+	}
+
+	criteriaBoost := map[string]float64{
+		"durability":        0.05,
+		"reversibility":     0.06,
+		"eco_friendly":      0.06,
+		"weather_resistance": 0.05,
+		"breathable":        0.05,
+		"cost_effective":    0.05,
+		"longevity":         0.05,
+	}
+
+	boostMap := map[string]string{
+		"耐久性优先":   "durability",
+		"可逆性优先":   "reversibility",
+		"环保优先":     "eco_friendly",
+		"耐候性优先":   "weather_resistance",
+		"透气性优先":   "breathable",
+		"经济性优先":   "cost_effective",
+		"寿命优先":     "longevity",
+	}
+
+	for _, c := range criteria {
+		if key, ok := boostMap[c]; ok {
+			if boost, ok2 := criteriaBoost[key]; ok2 {
+				switch key {
+				case "durability":
+					baseWeights["durability"] += boost
+					baseWeights["lifespanYears"] += 0.02
+				case "reversibility":
+					baseWeights["reversibility"] += boost
+				case "eco_friendly":
+					baseWeights["environmentalFriendliness"] += boost
+					baseWeights["reversibility"] += 0.02
+				case "weather_resistance":
+					baseWeights["weatherResistance"] += boost
+				case "breathable":
+					baseWeights["permeability"] += boost
+				case "cost_effective":
+					baseWeights["costPerUnit"] += boost
+					baseWeights["coverageRate"] += 0.03
+				case "longevity":
+					baseWeights["durability"] += boost * 0.6
+					baseWeights["lifespanYears"] += boost * 0.4
+				}
+			}
+		}
+	}
+
+	t.SetWeights(baseWeights)
+}
+
+type MaterialCandidate struct {
+	ID                       int
+	Name                     string
+	Category                 string
+	WeatherResistance        float64
+	Permeability             float64
+	Adhesion                 float64
+	Reversibility            float64
+	Durability               float64
+	EnvironmentalFriendliness float64
+	CostPerUnit              float64
+	CoverageRate             float64
+	ApplicableRockTypes      string
+	ConstructionDifficulty   int
+	LifespanYears            float64
+	Description              string
+}
+
+func (t *TOPSIS) Evaluate(materials []MaterialCandidate, rockType, budgetLevel, protectionType string) []map[string]interface{} {
+	var candidates []MaterialCandidate
+	for _, m := range materials {
+		rockTypes := parseRockTypes(m.ApplicableRockTypes)
+		if isRockTypeApplicable(rockTypes, rockType) {
+			candidates = append(candidates, m)
+		}
+	}
+
+	if len(candidates) == 0 {
+		candidates = materials
+	}
+
+	filtered := applyBudgetFilter(candidates, budgetLevel, protectionType)
+	if len(filtered) > 0 {
+		candidates = filtered
+	}
+
+	attrs := []string{
+		"weatherResistance", "permeability", "adhesion", "reversibility",
+		"durability", "environmentalFriendliness", "costPerUnit",
+		"coverageRate", "lifespanYears",
+	}
+
+	dataMatrix := make([][]float64, len(candidates))
+	for i, c := range candidates {
+		row := make([]float64, len(attrs))
+		row[0] = c.WeatherResistance
+		row[1] = c.Permeability
+		row[2] = c.Adhesion
+		row[3] = c.Reversibility
+		row[4] = c.Durability
+		row[5] = c.EnvironmentalFriendliness
+		row[6] = c.CostPerUnit
+		row[7] = c.CoverageRate
+		row[8] = c.LifespanYears
+		dataMatrix[i] = row
+	}
+
+	normMatrix := normalizeMatrix(dataMatrix)
+	weightedMatrix := applyWeights(normMatrix, t.getWeightArray(attrs))
+	idealBest, idealWorst := computeIdealSolutions(weightedMatrix, attrs)
+
+	scores := make([]map[string]interface{}, len(candidates))
+	for i, c := range candidates {
+		dPlus := euclideanDistance(weightedMatrix[i], idealBest)
+		dMinus := euclideanDistance(weightedMatrix[i], idealWorst)
+		closeness := 0.0
+		if dPlus+dMinus > 0 {
+			closeness = dMinus / (dPlus + dMinus)
+		}
+		normalizedCost := normalizeCost(c.CostPerUnit, candidates)
+
+		scores[i] = map[string]interface{}{
+			"id":                       c.ID,
+			"name":                     c.Name,
+			"category":                 c.Category,
+			"topsisScore":              roundFloat(closeness, 4),
+			"normalizedCost":           roundFloat(normalizedCost, 4),
+			"distanceToBest":           roundFloat(dPlus, 4),
+			"distanceToWorst":          roundFloat(dMinus, 4),
+			"costPerUnit":              c.CostPerUnit,
+			"coverageRate":             c.CoverageRate,
+			"lifespanYears":            c.LifespanYears,
+			"weatherResistance":        c.WeatherResistance,
+			"permeability":             c.Permeability,
+			"reversibility":            c.Reversibility,
+			"durability":               c.Durability,
+			"environmentalFriendliness": c.EnvironmentalFriendliness,
+			"constructionDifficulty":   c.ConstructionDifficulty,
+			"description":              c.Description,
+			"applicableRockTypes":      c.ApplicableRockTypes,
+		}
+	}
+
+	sort.Slice(scores, func(i, j int) bool {
+		return scores[i]["topsisScore"].(float64) > scores[j]["topsisScore"].(float64)
+	})
+
+	for i := range scores {
+		scores[i]["rank"] = i + 1
+	}
+
+	return scores
+}
+
+func parseRockTypes(jsonStr string) []string {
+	var types []string
+	err := json.Unmarshal([]byte(jsonStr), &types)
+	if err != nil {
+		return []string{"所有类型"}
+	}
+	return types
+}
+
+func isRockTypeApplicable(applicable []string, target string) bool {
+	for _, t := range applicable {
+		if t == "所有类型" || t == target {
+			return true
+		}
+	}
+	return false
+}
+
+func applyBudgetFilter(candidates []MaterialCandidate, budgetLevel, protectionType string) []MaterialCandidate {
+	var result []MaterialCandidate
+
+	costRanges := map[string][2]float64{
+		"LOW":    {0, 250},
+		"MEDIUM": {150, 500},
+		"HIGH":   {300, 1000},
+	}
+
+	for _, c := range candidates {
+		include := true
+		if rng, ok := costRanges[budgetLevel]; ok {
+			if c.CostPerUnit < rng[0] || c.CostPerUnit > rng[1] {
+				include = false
+			}
+		}
+
+		switch protectionType {
+		case "SURFACE":
+			if c.Category == "环氧树脂" {
+				include = false
+			}
+		case "REINFORCEMENT":
+			if c.Adhesion < 7 {
+				include = false
+			}
+		case "WATERPROOF":
+			if c.WeatherResistance < 8 || c.Permeability < 7 {
+				include = false
+			}
+		}
+
+		if include {
+			result = append(result, c)
+		}
+	}
+
+	if len(result) < 2 {
+		return nil
+	}
+	return result
+}
+
+func (t *TOPSIS) getWeightArray(attrs []string) []float64 {
+	weights := make([]float64, len(attrs))
+	for i, attr := range attrs {
+		weights[i] = t.Weights[attr]
+	}
+	return weights
+}
+
+func normalizeMatrix(matrix [][]float64) [][]float64 {
+	if len(matrix) == 0 {
+		return matrix
+	}
+	nCols := len(matrix[0])
+	result := make([][]float64, len(matrix))
+
+	for j := 0; j < nCols; j++ {
+		var sumSq float64
+		for i := range matrix {
+			sumSq += matrix[i][j] * matrix[i][j]
+		}
+		norm := math.Sqrt(sumSq)
+		if norm == 0 {
+			norm = 1
+		}
+		for i := range matrix {
+			if result[i] == nil {
+				result[i] = make([]float64, nCols)
+			}
+			result[i][j] = matrix[i][j] / norm
+		}
+	}
+	return result
+}
+
+func applyWeights(matrix [][]float64, weights []float64) [][]float64 {
+	result := make([][]float64, len(matrix))
+	for i := range matrix {
+		row := make([]float64, len(matrix[i]))
+		for j := range matrix[i] {
+			row[j] = matrix[i][j] * weights[j]
+		}
+		result[i] = row
+	}
+	return result
+}
+
+func computeIdealSolutions(matrix [][]float64, attrs []string) ([]float64, []float64) {
+	nCols := len(attrs)
+	best := make([]float64, nCols)
+	worst := make([]float64, nCols)
+
+	for j := 0; j < nCols; j++ {
+		maxVal := matrix[0][j]
+		minVal := matrix[0][j]
+		for i := 1; i < len(matrix); i++ {
+			if matrix[i][j] > maxVal {
+				maxVal = matrix[i][j]
+			}
+			if matrix[i][j] < minVal {
+				minVal = matrix[i][j]
+			}
+		}
+		if t, ok := defaultBenefitAttrs()[attrs[j]]; ok && t {
+			best[j] = maxVal
+			worst[j] = minVal
+		} else {
+			best[j] = minVal
+			worst[j] = maxVal
+		}
+	}
+	return best, worst
+}
+
+func defaultBenefitAttrs() map[string]bool {
+	return map[string]bool{
+		"weatherResistance":         true,
+		"permeability":              true,
+		"adhesion":                  true,
+		"reversibility":             true,
+		"durability":                true,
+		"environmentalFriendliness": true,
+		"coverageRate":              true,
+		"lifespanYears":             true,
+		"costPerUnit":              false,
+	}
+}
+
+func euclideanDistance(a, b []float64) float64 {
+	var sum float64
+	for i := range a {
+		diff := a[i] - b[i]
+		sum += diff * diff
+	}
+	return math.Sqrt(sum)
+}
+
+func normalizeCost(cost float64, candidates []MaterialCandidate) float64 {
+	minCost := candidates[0].CostPerUnit
+	maxCost := candidates[0].CostPerUnit
+	for _, c := range candidates[1:] {
+		if c.CostPerUnit < minCost {
+			minCost = c.CostPerUnit
+		}
+		if c.CostPerUnit > maxCost {
+			maxCost = c.CostPerUnit
+		}
+	}
+	if maxCost == minCost {
+		return 0.5
+	}
+	return (cost - minCost) / (maxCost - minCost)
+}
+
+func roundFloat(val float64, precision int) float64 {
+	ratio := math.Pow(10, float64(precision))
+	return math.Round(val*ratio) / ratio
+}
+
+func GenerateMaterialRecommendations(results []map[string]interface{}) []string {
+	var recs []string
+
+	if len(results) == 0 {
+		recs = append(recs, "未找到符合条件的保护材料，请调整筛选条件。")
+		return recs
+	}
+
+	top3 := results
+	if len(top3) > 3 {
+		top3 = top3[:3]
+	}
+
+	recs = append(recs, "=== 保护材料推荐方案 ===")
+	for _, r := range top3 {
+		rank := r["rank"].(int)
+		name := r["name"].(string)
+		category := r["category"].(string)
+		score := r["topsisScore"].(float64)
+		cost := r["costPerUnit"].(float64)
+		lifespan := r["lifespanYears"].(float64)
+		recs = append(recs,
+			"方案#%d: %s (%s类) - 综合评分: %.4f, 单价: ¥%.2f/kg, 预期寿命: %.1f年",
+			rank, name, category, score, cost, lifespan)
+	}
+
+	if len(results) >= 2 {
+		best := results[0]
+		alt := results[1]
+		recs = append(recs,
+			"\n建议优先采用「%s」，其综合表现最优。", best["name"].(string))
+		if best["topsisScore"].(float64)-alt["topsisScore"].(float64) < 0.05 {
+			recs = append(recs,
+				"「%s」与第一名评分接近，可作为备选方案。", alt["name"].(string))
+		}
+	}
+
+	return recs
+}
