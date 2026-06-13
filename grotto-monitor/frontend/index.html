@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>古代石窟风化速率监测与现代保护材料优选系统</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div id="app">
+        <header class="header">
+            <div class="header-left">
+                <h1>🏛️ 古代石窟风化监测系统</h1>
+                <span class="subtitle">Grotto Weathering Monitoring System</span>
+            </div>
+            <div class="header-right">
+                <div id="connection-status" class="status-badge status-disconnected">
+                    <span class="status-dot"></span>
+                    <span class="status-text">未连接</span>
+                </div>
+                <div id="alert-count" class="alert-badge hidden">
+                    <span class="alert-icon">⚠️</span>
+                    <span class="alert-number">0</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="main-container">
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <h3>🗺️ 石窟列表</h3>
+                    <div id="site-list" class="site-list"></div>
+                </div>
+                <div class="sidebar-section">
+                    <h3>📊 数据分析</h3>
+                    <div class="analysis-tools">
+                        <button id="btn-prediction" class="tool-btn">
+                            <span class="btn-icon">🔮</span>
+                            <span>风化速率预测</span>
+                        </button>
+                        <button id="btn-topsis" class="tool-btn">
+                            <span class="btn-icon">🧪</span>
+                            <span>保护材料优选</span>
+                        </button>
+                        <button id="btn-alerts" class="tool-btn">
+                            <span class="btn-icon">🔔</span>
+                            <span>告警管理</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="sidebar-section">
+                    <h3>ℹ️ 当前选择</h3>
+                    <div id="current-site-info" class="site-info">
+                        <p class="empty-hint">请选择一个石窟</p>
+                    </div>
+                </div>
+            </aside>
+
+            <main class="content">
+                <div class="view-container">
+                    <div id="view-3d" class="view active">
+                        <div class="view-header">
+                            <h2 id="view-title">石窟三维模型</h2>
+                            <div class="view-controls">
+                                <label class="control-item">
+                                    <input type="checkbox" id="toggle-heatmap" checked>
+                                    <span>显示热力图</span>
+                                </label>
+                                <label class="control-item">
+                                    <input type="checkbox" id="toggle-cracks" checked>
+                                    <span>显示裂隙</span>
+                                </label>
+                                <label class="control-item">
+                                    <input type="checkbox" id="toggle-sensors" checked>
+                                    <span>显示监测点</span>
+                                </label>
+                            </div>
+                        </div>
+                        <div id="canvas-container" class="canvas-container">
+                            <canvas id="heatmap-canvas" class="heatmap-canvas"></canvas>
+                            <div id="three-container" class="three-container"></div>
+                            <div id="loading-overlay" class="loading-overlay">
+                                <div class="loading-spinner"></div>
+                                <p>加载三维模型中...</p>
+                            </div>
+                        </div>
+                        <div class="legend-bar">
+                            <div class="legend-item">
+                                <div class="legend-color" style="background: linear-gradient(to right, #00ff00, #ffff00, #ff6600, #ff0000);"></div>
+                                <span>风化程度: 低 → 高</span>
+                            </div>
+                            <div class="legend-item">
+                                <div class="legend-icon">🔴</div>
+                                <span>裂隙监测点</span>
+                            </div>
+                            <div class="legend-item">
+                                <div class="legend-icon">🔵</div>
+                                <span>温湿度监测点</span>
+                            </div>
+                            <div class="legend-item">
+                                <div class="legend-icon">🟢</div>
+                                <span>硬度监测点</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="view-prediction" class="view">
+                        <div class="view-header">
+                            <h2>🔮 风化速率预测</h2>
+                        </div>
+                        <div class="prediction-container">
+                            <div class="prediction-form">
+                                <div class="form-group">
+                                    <label>选择石窟</label>
+                                    <select id="prediction-site"></select>
+                                </div>
+                                <div class="form-group">
+                                    <label>温度 (°C)</label>
+                                    <input type="range" id="prediction-temp" min="-10" max="50" value="25" step="0.5">
+                                    <span id="temp-value">25°C</span>
+                                </div>
+                                <div class="form-group">
+                                    <label>相对湿度 (%)</label>
+                                    <input type="range" id="prediction-humidity" min="0" max="100" value="50" step="1">
+                                    <span id="humidity-value">50%</span>
+                                </div>
+                                <button id="btn-do-predict" class="primary-btn">开始预测</button>
+                            </div>
+                            <div class="prediction-result" id="prediction-result">
+                                <p class="empty-hint">请设置参数并点击预测</p>
+                            </div>
+                        </div>
+                        <div class="batch-prediction">
+                            <h3>📈 多场景预测分析</h3>
+                            <button id="btn-batch-predict" class="primary-btn">生成温湿度组合预测</button>
+                            <div id="batch-result" class="batch-result"></div>
+                        </div>
+                    </div>
+
+                    <div id="view-topsis" class="view">
+                        <div class="view-header">
+                            <h2>🧪 保护材料优选 (TOPSIS)</h2>
+                        </div>
+                        <div class="topsis-container">
+                            <div class="topsis-form">
+                                <div class="form-group">
+                                    <label>石窟岩石类型</label>
+                                    <select id="topsis-rocktype">
+                                        <option value="砂岩">砂岩</option>
+                                        <option value="石灰岩">石灰岩</option>
+                                        <option value="花岗岩">花岗岩</option>
+                                        <option value="砂砾岩">砂砾岩</option>
+                                    </select>
+                                </div>
+                                <h4>属性权重设置 (0-1)</h4>
+                                <div class="weight-sliders">
+                                    <div class="form-group">
+                                        <label>渗透深度</label>
+                                        <input type="range" id="weight-penetration" min="0" max="1" value="0.15" step="0.05">
+                                        <span id="weight-penetration-value">0.15</span>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>透气性</label>
+                                        <input type="range" id="weight-breathability" min="0" max="1" value="0.20" step="0.05">
+                                        <span id="weight-breathability-value">0.20</span>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>耐候性</label>
+                                        <input type="range" id="weight-weathering" min="0" max="1" value="0.25" step="0.05">
+                                        <span id="weight-weathering-value">0.25</span>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>兼容性</label>
+                                        <input type="range" id="weight-compatibility" min="0" max="1" value="0.20" step="0.05">
+                                        <span id="weight-compatibility-value">0.20</span>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>成本</label>
+                                        <input type="range" id="weight-cost" min="0" max="1" value="0.10" step="0.05">
+                                        <span id="weight-cost-value">0.10</span>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>耐用年限</label>
+                                        <input type="range" id="weight-durability" min="0" max="1" value="0.10" step="0.05">
+                                        <span id="weight-durability-value">0.10</span>
+                                    </div>
+                                </div>
+                                <button id="btn-do-topsis" class="primary-btn">开始优化分析</button>
+                            </div>
+                            <div class="topsis-result" id="topsis-result">
+                                <p class="empty-hint">请设置权重并开始分析</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="view-alerts" class="view">
+                        <div class="view-header">
+                            <h2>🔔 告警管理</h2>
+                            <div class="alert-filters">
+                                <label>
+                                    <input type="checkbox" id="filter-unacknowledged" checked>
+                                    <span>仅显示未确认</span>
+                                </label>
+                                <select id="filter-site">
+                                    <option value="">全部石窟</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div id="alerts-list" class="alerts-list">
+                            <p class="empty-hint">暂无告警信息</p>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <div id="sensor-modal" class="modal hidden">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 id="modal-title">监测点详情</h3>
+                    <button class="modal-close" onclick="closeModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div id="modal-sensor-info" class="sensor-info-card"></div>
+                    <div class="charts-container">
+                        <div class="chart-wrapper">
+                            <h4>📈 近30天数据趋势</h4>
+                            <canvas id="chart-hourly"></canvas>
+                        </div>
+                        <div class="chart-wrapper">
+                            <h4>📊 近1年风化速率趋势</h4>
+                            <canvas id="chart-weathering"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="alert-toast-container" class="toast-container"></div>
+    </div>
+
+    <script src="js/api.js"></script>
+    <script src="js/websocket.js"></script>
+    <script src="js/grotto3d.js"></script>
+    <script src="js/heatmap.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>
