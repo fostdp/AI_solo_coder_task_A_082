@@ -58,8 +58,8 @@ func main() {
 
 	repo := repository.NewRepository(db)
 
-	predictionSvc := &services.WeatheringPredictionService{}
-	topsisSvc := &services.TOPSISService{}
+	predictionSvc := services.NewWeatheringPredictionService()
+	topsisSvc := services.NewTOPSISService()
 
 	hub := websocket.NewHub()
 	go hub.Run()

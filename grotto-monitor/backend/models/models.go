@@ -137,10 +137,13 @@ type TOPSISResult struct {
 }
 
 type TOPSISResponse struct {
-	Results          []TOPSISResult `json:"results"`
-	DecisionMatrix   [][]float64    `json:"decision_matrix"`
-	NormalizedMatrix [][]float64    `json:"normalized_matrix"`
-	WeightedMatrix   [][]float64    `json:"weighted_matrix"`
+	Results             []TOPSISResult             `json:"results"`
+	DecisionMatrix      [][]float64                `json:"decision_matrix"`
+	NormalizedMatrix    [][]float64                `json:"normalized_matrix"`
+	WeightedMatrix      [][]float64                `json:"weighted_matrix"`
+	MissingInfo         []map[string]interface{}   `json:"missing_info,omitempty"`
+	SensitivityAnalysis []SensitivityAnalysisResult `json:"sensitivity_analysis,omitempty"`
+	StabilityScore      float64                    `json:"stability_score"`
 }
 
 type WeatheringRatePoint struct {
@@ -148,4 +151,26 @@ type WeatheringRatePoint struct {
 	Rate         float64   `json:"rate"`
 	Temperature  float64   `json:"temperature"`
 	Humidity     float64   `json:"humidity"`
+}
+
+type GrottoFeatureVector struct {
+	Latitude        float64
+	Longitude       float64
+	RockTypeOneHot  []float64
+	ClimateZone     float64
+	Elevation       float64
+	AnnualAvgTemp   float64
+	AnnualAvgHum    float64
+	AridityIndex    float64
+	TemperatureVar  float64
+	HumidityVar     float64
+}
+
+type SensitivityAnalysisResult struct {
+	AttributeName   string  `json:"attribute_name"`
+	OriginalWeight  float64 `json:"original_weight"`
+	PerturbedWeight float64 `json:"perturbed_weight"`
+	ScoreChange     float64 `json:"score_change"`
+	RankChange      int     `json:"rank_change"`
+	Sensitivity     float64 `json:"sensitivity"`
 }

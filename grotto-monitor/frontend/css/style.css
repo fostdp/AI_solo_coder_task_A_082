@@ -387,6 +387,33 @@ body {
     font-size: 14px;
 }
 
+.loading-overlay .loading-text {
+    margin-bottom: 16px;
+}
+
+.loading-progress-bar {
+    width: 200px;
+    height: 6px;
+    background: rgba(100, 116, 139, 0.2);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.loading-progress-fill {
+    height: 100%;
+    width: 5%;
+    background: linear-gradient(90deg, #3b82f6, #8b5cf6, #3b82f6);
+    background-size: 200% 100%;
+    animation: progressShimmer 2s linear infinite;
+    border-radius: 3px;
+    transition: width 0.3s ease;
+}
+
+@keyframes progressShimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
 .legend-bar {
     display: flex;
     justify-content: center;
