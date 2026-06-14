@@ -75,7 +75,7 @@ class Grotto3DViewer {
 
     isHighEndDevice() {
         const cores = navigator.hardwareConcurrency || 4;
-        const memory = (navigator as any).deviceMemory || 4;
+        const memory = navigator.deviceMemory || 4;
         return cores >= 6 && memory >= 4;
     }
 
@@ -305,7 +305,7 @@ class Grotto3DViewer {
     }
 
     createRockMaterial(color, level) {
-        const materialOptions: any = {
+        const materialOptions = {
             color: color,
             roughness: level === 0 ? 1.0 : level === 1 ? 0.92 : 0.88,
             metalness: level === 0 ? 0.0 : level === 1 ? 0.08 : 0.12,

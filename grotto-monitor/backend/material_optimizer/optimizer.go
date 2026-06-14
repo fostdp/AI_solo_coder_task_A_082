@@ -1,32 +1,93 @@
-package services
+package material_optimizer
 
 import (
+	"encoding/json"
 	"errors"
 	"math"
+	"net/http"
 	"sort"
 	"sync"
 
+	"github.com/gorilla/mux"
+
+	"grotto-monitor/backend/config"
 	"grotto-monitor/backend/models"
+	"grotto-monitor/backend/repository"
 )
 
-type TOPSISService struct {
+type MaterialOptimizer struct {
+	repo            *repository.Repository
+	params          config.TOPSISParams
 	imputationCache map[string][]float64
 	cacheMu         sync.RWMutex
 }
 
-func NewTOPSISService() *TOPSISService {
-	return &TOPSISService{
+func NewMaterialOptimizer(repo *repository.Repository, params config.TOPSISParams) *MaterialOptimizer {
+	return &MaterialOptimizer{
+		repo:            repo,
+		params:          params,
 		imputationCache: make(map[string][]float64),
 	}
 }
 
-var defaultWeights = map[string]float64{
-	"penetration_depth":     0.15,
-	"breathability":         0.20,
-	"weathering_resistance": 0.25,
-	"compatibility":         0.20,
-	"cost":                  0.10,
-	"durability_years":      0.10,
+func (mo *MaterialOptimizer) RegisterRoutes(r *mux.Router) {
+	r.Use(corsMiddleware)
+	api := r.PathPrefix("/api").Subrouter()
+	api.HandleFunc("/materials", mo.GetMaterials).Methods("GET", "OPTIONS")
+	api.HandleFunc("/topsis", mo.OptimizeMaterials).Methods("POST", "OPTIONS")
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func respondError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+func (mo *MaterialOptimizer) GetMaterials(w http.ResponseWriter, r *http.Request) {
+	materials, err := mo.repo.GetAllMaterials()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, materials)
+}
+
+func (mo *MaterialOptimizer) OptimizeMaterials(w http.ResponseWriter, r *http.Request) {
+	var input models.TOPSISRequest
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	materials, err := mo.repo.GetAllMaterials()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	result, err := mo.Optimize(materials, input)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, result)
 }
 
 var attributeOrder = []string{
@@ -47,17 +108,20 @@ var attributeDisplayName = map[string]string{
 	"durability_years":      "耐用年限",
 }
 
-var nonBenefitAttributes = map[string]bool{
-	"cost": true,
+func (mo *MaterialOptimizer) buildNonBenefitMap() map[string]bool {
+	nonBenefit := make(map[string]bool, len(mo.params.NonBenefitAttributes))
+	for _, attr := range mo.params.NonBenefitAttributes {
+		nonBenefit[attr] = true
+	}
+	return nonBenefit
 }
 
-var attributeRanges = map[string][2]float64{
-	"penetration_depth":     {0.5, 5.0},
-	"breathability":         {50.0, 95.0},
-	"weathering_resistance": {60.0, 98.0},
-	"compatibility":         {50.0, 95.0},
-	"cost":                  {20.0, 500.0},
-	"durability_years":      {3.0, 30.0},
+func (mo *MaterialOptimizer) buildAttributeRangesMap() map[string][2]float64 {
+	ranges := make(map[string][2]float64, len(mo.params.AttributeRanges))
+	for k, v := range mo.params.AttributeRanges {
+		ranges[k] = v
+	}
+	return ranges
 }
 
 type materialWithFeatures struct {
@@ -143,7 +207,9 @@ func euclideanDistanceNaN(a, b []float64, aMissing, bMissing []bool) (float64, i
 	return math.Sqrt(adjusted), validCount
 }
 
-func (svc *TOPSISService) knnImpute(materials []models.ProtectionMaterial, k int) []models.ProtectionMaterial {
+func (mo *MaterialOptimizer) knnImpute(materials []models.ProtectionMaterial, k int) []models.ProtectionMaterial {
+	ranges := mo.buildAttributeRangesMap()
+
 	imputed := make([]models.ProtectionMaterial, len(materials))
 	dataWithFeatures := make([]materialWithFeatures, len(materials))
 
@@ -230,12 +296,12 @@ func (svc *TOPSISService) knnImpute(materials []models.ProtectionMaterial, k int
 			if totalWeight > 0 {
 				imputedVal := weightedSum / totalWeight
 				attr := attributeOrder[attrIdx]
-				rng := attributeRanges[attr]
+				rng := ranges[attr]
 				imputedVal = math.Max(rng[0], math.Min(rng[1], imputedVal))
 				setAttributeValue(&imputed[i], attr, math.Round(imputedVal*100)/100)
 			} else {
 				attr := attributeOrder[attrIdx]
-				rng := attributeRanges[attr]
+				rng := ranges[attr]
 				fallback := (rng[0] + rng[1]) / 2
 				setAttributeValue(&imputed[i], attr, math.Round(fallback*100)/100)
 			}
@@ -300,7 +366,7 @@ func applyWeights(norm [][]float64, weights []float64) [][]float64 {
 	return weighted
 }
 
-func determineIdealBest(weighted [][]float64) []float64 {
+func (mo *MaterialOptimizer) determineIdealBest(weighted [][]float64) []float64 {
 	n := len(weighted)
 	if n == 0 {
 		return nil
@@ -308,11 +374,13 @@ func determineIdealBest(weighted [][]float64) []float64 {
 	numCols := len(weighted[0])
 	ideal := make([]float64, numCols)
 
+	nonBenefit := mo.buildNonBenefitMap()
+
 	for j := 0; j < numCols; j++ {
 		attr := attributeOrder[j]
 		ideal[j] = weighted[0][j]
 		for i := 1; i < n; i++ {
-			if nonBenefitAttributes[attr] {
+			if nonBenefit[attr] {
 				if weighted[i][j] < ideal[j] {
 					ideal[j] = weighted[i][j]
 				}
@@ -326,7 +394,7 @@ func determineIdealBest(weighted [][]float64) []float64 {
 	return ideal
 }
 
-func determineIdealWorst(weighted [][]float64) []float64 {
+func (mo *MaterialOptimizer) determineIdealWorst(weighted [][]float64) []float64 {
 	n := len(weighted)
 	if n == 0 {
 		return nil
@@ -334,11 +402,13 @@ func determineIdealWorst(weighted [][]float64) []float64 {
 	numCols := len(weighted[0])
 	ideal := make([]float64, numCols)
 
+	nonBenefit := mo.buildNonBenefitMap()
+
 	for j := 0; j < numCols; j++ {
 		attr := attributeOrder[j]
 		ideal[j] = weighted[0][j]
 		for i := 1; i < n; i++ {
-			if nonBenefitAttributes[attr] {
+			if nonBenefit[attr] {
 				if weighted[i][j] > ideal[j] {
 					ideal[j] = weighted[i][j]
 				}
@@ -366,13 +436,13 @@ type topsisRunResult struct {
 	ranks  []int
 }
 
-func runTOPSISOnce(materials []models.ProtectionMaterial, weightSlice []float64) topsisRunResult {
+func (mo *MaterialOptimizer) runTOPSISOnce(materials []models.ProtectionMaterial, weightSlice []float64) topsisRunResult {
 	decisionMatrix := buildDecisionMatrix(materials)
 	normalized := normalizeMatrix(decisionMatrix)
 	weighted := applyWeights(normalized, weightSlice)
 
-	idealBest := determineIdealBest(weighted)
-	idealWorst := determineIdealWorst(weighted)
+	idealBest := mo.determineIdealBest(weighted)
+	idealWorst := mo.determineIdealWorst(weighted)
 
 	n := len(materials)
 	scores := make([]float64, n)
@@ -407,14 +477,14 @@ func runTOPSISOnce(materials []models.ProtectionMaterial, weightSlice []float64)
 	return topsisRunResult{scores: scores, ranks: ranks}
 }
 
-func (svc *TOPSISService) SensitivityAnalysis(
+func (mo *MaterialOptimizer) SensitivityAnalysis(
 	materials []models.ProtectionMaterial,
 	baseWeights map[string]float64,
 	baseResult topsisRunResult,
 ) []models.SensitivityAnalysisResult {
 	results := make([]models.SensitivityAnalysisResult, 0, len(attributeOrder)*2)
 
-	perturbationAmounts := []float64{0.20, -0.20}
+	perturbationAmounts := []float64{mo.params.SensitivityPerturbation, -mo.params.SensitivityPerturbation}
 
 	for attrIdx, attr := range attributeOrder {
 		baseWeight := baseWeights[attr]
@@ -460,7 +530,7 @@ func (svc *TOPSISService) SensitivityAnalysis(
 				weightSlice[i] = perturbedWeights[a]
 			}
 
-			perturbedResult := runTOPSISOnce(materials, weightSlice)
+			perturbedResult := mo.runTOPSISOnce(materials, weightSlice)
 
 			scoreChangeSum := 0.0
 			rankChangeSum := 0
@@ -473,8 +543,15 @@ func (svc *TOPSISService) SensitivityAnalysis(
 			avgRankChange := float64(rankChangeSum) / float64(len(baseResult.scores))
 			sensitivity := avgScoreChange*10 + avgRankChange*0.05
 
+			perturbLabel := ""
+			if perturb > 0 {
+				perturbLabel = " (+)"
+			} else {
+				perturbLabel = " (-)"
+			}
+
 			results = append(results, models.SensitivityAnalysisResult{
-				AttributeName:   attributeDisplayName[attr] + (map[float64]string{0.2: " (+)", -0.2: " (-)"}[perturb]),
+				AttributeName:   attributeDisplayName[attr] + perturbLabel,
 				OriginalWeight:  math.Round(baseWeight*1000) / 1000,
 				PerturbedWeight: math.Round(perturbedWeights[attr]*1000) / 1000,
 				ScoreChange:     math.Round(avgScoreChange*10000) / 10000,
@@ -492,12 +569,12 @@ func (svc *TOPSISService) SensitivityAnalysis(
 	return results
 }
 
-func (svc *TOPSISService) Optimize(materials []models.ProtectionMaterial, req models.TOPSISRequest) (*models.TOPSISResponse, error) {
+func (mo *MaterialOptimizer) Optimize(materials []models.ProtectionMaterial, req models.TOPSISRequest) (*models.TOPSISResponse, error) {
 	if len(materials) == 0 {
 		return nil, errors.New("no materials provided")
 	}
 
-	imputedMaterials := svc.knnImpute(materials, 3)
+	imputedMaterials := mo.knnImpute(materials, mo.params.KnnK)
 
 	missingInfo := make([]map[string]interface{}, 0)
 	for i, orig := range materials {
@@ -518,15 +595,15 @@ func (svc *TOPSISService) Optimize(materials []models.ProtectionMaterial, req mo
 				}
 			}
 			missingInfo = append(missingInfo, map[string]interface{}{
-				"material_name": orig.Name,
-				"missing_attrs": missingAttrs,
+				"material_name":  orig.Name,
+				"missing_attrs":  missingAttrs,
 				"imputed_values": imputedVals,
 			})
 		}
 	}
 
 	effectiveWeights := make(map[string]float64)
-	for k, v := range defaultWeights {
+	for k, v := range mo.params.DefaultWeights {
 		effectiveWeights[k] = v
 	}
 	for k, v := range req.Priorities {
@@ -550,8 +627,8 @@ func (svc *TOPSISService) Optimize(materials []models.ProtectionMaterial, req mo
 	normalized := normalizeMatrix(decisionMatrix)
 	weighted := applyWeights(normalized, weightSlice)
 
-	idealBest := determineIdealBest(weighted)
-	idealWorst := determineIdealWorst(weighted)
+	idealBest := mo.determineIdealBest(weighted)
+	idealWorst := mo.determineIdealWorst(weighted)
 
 	n := len(imputedMaterials)
 	scores := make([]float64, n)
@@ -594,7 +671,7 @@ func (svc *TOPSISService) Optimize(materials []models.ProtectionMaterial, req mo
 		baseRun.ranks[r.idx] = rank + 1
 	}
 
-	sensitivityAnalysis := svc.SensitivityAnalysis(imputedMaterials, effectiveWeights, baseRun)
+	sensitivityAnalysis := mo.SensitivityAnalysis(imputedMaterials, effectiveWeights, baseRun)
 
 	stabilityScore := 1.0
 	if len(sensitivityAnalysis) > 0 {
@@ -603,7 +680,7 @@ func (svc *TOPSISService) Optimize(materials []models.ProtectionMaterial, req mo
 			avgSensitivity += sa.Sensitivity
 		}
 		avgSensitivity /= float64(len(sensitivityAnalysis))
-		stabilityScore = math.Max(0, 1.0-avgSensitivity*2.0)
+		stabilityScore = math.Max(0, 1.0-avgSensitivity*mo.params.StabilitySensitivityScale)
 		stabilityScore = math.Round(stabilityScore*1000) / 1000
 	}
 

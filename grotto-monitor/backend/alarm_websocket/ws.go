@@ -1,4 +1,4 @@
-package websocket
+package alarm_websocket
 
 import (
 	"encoding/json"
@@ -6,12 +6,29 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/google/uuid"
+	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
+
+	"grotto-monitor/backend/config"
+	"grotto-monitor/backend/models"
+	"grotto-monitor/backend/repository"
 )
+
+type AlertEvent struct {
+	SiteID      int       `json:"site_id"`
+	SensorID    int       `json:"sensor_id"`
+	AlertType   string    `json:"alert_type"`
+	Severity    string    `json:"severity"`
+	Message     string    `json:"message"`
+	Value       float64   `json:"value"`
+	Threshold   float64   `json:"threshold"`
+	TriggeredAt time.Time `json:"triggered_at"`
+}
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -30,19 +47,21 @@ type QueuedMessage struct {
 }
 
 type OfflineMessageStore struct {
-	mu        sync.RWMutex
-	messages  map[string][]QueuedMessage
-	persistPath string
-	maxPerClient int
-	messageTTL  time.Duration
+	mu              sync.RWMutex
+	messages        map[string][]QueuedMessage
+	persistPath     string
+	maxPerClient    int
+	messageTTL      time.Duration
+	cleanupInterval time.Duration
 }
 
-func NewOfflineMessageStore(persistPath string) *OfflineMessageStore {
+func NewOfflineMessageStore(maxPerClient int, messageTTL time.Duration, persistPath string, cleanupInterval time.Duration) *OfflineMessageStore {
 	store := &OfflineMessageStore{
-		messages:     make(map[string][]QueuedMessage),
-		persistPath:  persistPath,
-		maxPerClient: 100,
-		messageTTL:   24 * time.Hour,
+		messages:        make(map[string][]QueuedMessage),
+		persistPath:     persistPath,
+		maxPerClient:    maxPerClient,
+		messageTTL:      messageTTL,
+		cleanupInterval: cleanupInterval,
 	}
 	store.load()
 	go store.cleanupLoop()
@@ -121,7 +140,7 @@ func (s *OfflineMessageStore) DequeueAll(clientID string) []QueuedMessage {
 }
 
 func (s *OfflineMessageStore) cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Minute)
+	ticker := time.NewTicker(s.cleanupInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		s.cleanup()
@@ -158,23 +177,35 @@ type Client struct {
 }
 
 type Hub struct {
-	Clients        map[*Client]bool
-	ClientIDMap    map[string]*Client
-	Broadcast      chan []byte
-	Register       chan *Client
-	Unregister     chan *Client
-	OfflineStore   *OfflineMessageStore
-	mu             sync.RWMutex
+	Clients      map[*Client]bool
+	ClientIDMap  map[string]*Client
+	Broadcast    chan []byte
+	Register     chan *Client
+	Unregister   chan *Client
+	OfflineStore *OfflineMessageStore
+	alertCh      <-chan AlertEvent
+	repo         *repository.Repository
+	mu           sync.RWMutex
+	params       config.AlarmParams
 }
 
-func NewHub() *Hub {
+func NewHub(alertCh <-chan AlertEvent, repo *repository.Repository, params config.AlarmParams) *Hub {
+	offlineStore := NewOfflineMessageStore(
+		params.OfflineMaxPerClient,
+		time.Duration(params.OfflineTTLHours)*time.Hour,
+		params.OfflinePersistPath,
+		time.Duration(params.CleanupIntervalMinutes)*time.Minute,
+	)
 	return &Hub{
-		Broadcast:    make(chan []byte, 512),
+		Broadcast:    make(chan []byte, params.BroadcastBufferSize),
 		Register:     make(chan *Client),
 		Unregister:   make(chan *Client),
 		Clients:      make(map[*Client]bool),
 		ClientIDMap:  make(map[string]*Client),
-		OfflineStore: NewOfflineMessageStore("data/offline_messages.json"),
+		OfflineStore: offlineStore,
+		alertCh:      alertCh,
+		repo:         repo,
+		params:       params,
 	}
 }
 
@@ -194,9 +225,7 @@ func (h *Hub) Run() {
 			h.Clients[client] = true
 			h.ClientIDMap[client.ID] = client
 			h.mu.Unlock()
-
 			log.Printf("Client registered: %s (total: %d)", client.ID, len(h.Clients))
-
 			go h.sendOfflineMessages(client)
 
 		case client := <-h.Unregister:
@@ -213,6 +242,32 @@ func (h *Hub) Run() {
 
 		case message := <-h.Broadcast:
 			h.handleBroadcast(message)
+
+		case event := <-h.alertCh:
+			alert := models.Alert{
+				SiteID:       event.SiteID,
+				SensorID:     event.SensorID,
+				AlertType:    event.AlertType,
+				Severity:     event.Severity,
+				Message:      event.Message,
+				Value:        event.Value,
+				Threshold:    event.Threshold,
+				TriggeredAt:  event.TriggeredAt,
+				Acknowledged: false,
+			}
+			if _, err := h.repo.InsertAlert(alert); err != nil {
+				log.Printf("Failed to insert alert into DB: %v", err)
+			}
+			msg := WebSocketMessage{
+				Type: "alert",
+				Data: event,
+			}
+			msgBytes, err := json.Marshal(msg)
+			if err != nil {
+				log.Printf("Failed to marshal alert event: %v", err)
+				continue
+			}
+			h.Broadcast <- msgBytes
 		}
 	}
 }
@@ -243,7 +298,7 @@ func (h *Hub) handleBroadcast(message []byte) {
 		Type:      parsed.Type,
 		Data:      parsed.Data,
 		Timestamp: time.Now(),
-		TTL:       int64(24 * time.Hour / time.Second),
+		TTL:       int64(h.params.OfflineTTLHours * 3600),
 	}
 
 	queuedBytes, _ := json.Marshal(WebSocketMessage{
@@ -308,9 +363,10 @@ func (c *Client) ReadPump() {
 		c.Conn.Close()
 	}()
 	c.Conn.SetReadLimit(4096)
-	c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	pongTimeout := time.Duration(c.Hub.params.PongTimeoutSeconds) * time.Second
+	c.Conn.SetReadDeadline(time.Now().Add(pongTimeout))
 	c.Conn.SetPongHandler(func(string) error {
-		c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		c.Conn.SetReadDeadline(time.Now().Add(pongTimeout))
 		c.LastSeen = time.Now()
 		return nil
 	})
@@ -337,7 +393,9 @@ func (c *Client) ReadPump() {
 }
 
 func (c *Client) WritePump() {
-	ticker := time.NewTicker(54 * time.Second)
+	pingInterval := time.Duration(c.Hub.params.PingIntervalSeconds) * time.Second
+	writeTimeout := time.Duration(c.Hub.params.WriteTimeoutSeconds) * time.Second
+	ticker := time.NewTicker(pingInterval)
 	defer func() {
 		ticker.Stop()
 		c.Conn.Close()
@@ -345,7 +403,7 @@ func (c *Client) WritePump() {
 	for {
 		select {
 		case message, ok := <-c.Send:
-			c.Conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+			c.Conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if !ok {
 				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
@@ -390,7 +448,7 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		ID:       clientID,
 		Hub:      hub,
 		Conn:     conn,
-		Send:     make(chan []byte, 512),
+		Send:     make(chan []byte, hub.params.WebSocketBufferSize),
 		LastSeen: time.Now(),
 	}
 
@@ -398,7 +456,7 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	welcomeMsg, _ := json.Marshal(WebSocketMessage{
 		Type: "welcome",
 		Data: map[string]interface{}{
-			"client_id": clientID,
+			"client_id":   clientID,
 			"server_time": time.Now().Unix(),
 		},
 	})
@@ -411,15 +469,87 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	log.Printf("New WebSocket connection from %s (client_id: %s)", r.RemoteAddr, clientID)
 }
 
-func BroadcastAlert(hub *Hub, alertData interface{}) {
-	msg := WebSocketMessage{
-		Type: "alert",
-		Data: alertData,
+func (h *Hub) RegisterRoutes(r *mux.Router) {
+	r.HandleFunc("/ws/alerts", func(w http.ResponseWriter, r *http.Request) {
+		ServeWs(h, w, r)
+	}).Methods("GET")
+	r.HandleFunc("/api/alerts", h.GetAlerts).Methods("GET")
+	r.HandleFunc("/api/alerts/{id}/acknowledge", h.AcknowledgeAlert).Methods("PUT")
+}
+
+func (h *Hub) GetAlerts(w http.ResponseWriter, r *http.Request) {
+	var filter models.AlertFilter
+	q := r.URL.Query()
+	if siteIDStr := q.Get("site_id"); siteIDStr != "" {
+		siteID, err := strconv.Atoi(siteIDStr)
+		if err == nil {
+			filter.SiteID = &siteID
+		}
 	}
-	msgBytes, err := json.Marshal(msg)
+	if ackStr := q.Get("acknowledged"); ackStr != "" {
+		ack, err := strconv.ParseBool(ackStr)
+		if err == nil {
+			filter.Acknowledged = &ack
+		}
+	}
+
+	alerts, err := h.repo.GetAlerts(filter)
 	if err != nil {
-		log.Printf("Failed to marshal alert: %v", err)
+		log.Printf("Failed to get alerts: %v", err)
+		http.Error(w, "Failed to get alerts", http.StatusInternalServerError)
 		return
 	}
-	hub.Broadcast <- msgBytes
+	if alerts == nil {
+		alerts = []models.Alert{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(alerts)
+}
+
+func (h *Hub) AcknowledgeAlert(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	idStr := vars["id"]
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid alert ID", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.repo.AcknowledgeAlert(id); err != nil {
+		log.Printf("Failed to acknowledge alert %d: %v", id, err)
+		http.Error(w, "Failed to acknowledge alert", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":           id,
+		"acknowledged": true,
+	})
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("Failed to encode JSON response: %v", err)
+	}
+}
+
+func respondError(w http.ResponseWriter, status int, message string) {
+	respondJSON(w, status, map[string]string{"error": message})
 }

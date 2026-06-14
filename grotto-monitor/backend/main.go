@@ -10,10 +10,12 @@ import (
 
 	"github.com/gorilla/mux"
 
-	"grotto-monitor/backend/handlers"
+	"grotto-monitor/backend/alarm_websocket"
+	"grotto-monitor/backend/config"
+	"grotto-monitor/backend/material_optimizer"
 	"grotto-monitor/backend/repository"
-	"grotto-monitor/backend/services"
-	"grotto-monitor/backend/websocket"
+	"grotto-monitor/backend/sensor_receiver"
+	"grotto-monitor/backend/weathering_predictor"
 )
 
 func getEnv(key, defaultValue string) string {
@@ -58,16 +60,28 @@ func main() {
 
 	repo := repository.NewRepository(db)
 
-	predictionSvc := services.NewWeatheringPredictionService()
-	topsisSvc := services.NewTOPSISService()
+	configPath := getEnv("CONFIG_PATH", "config/model_params.json")
+	params, err := config.LoadModelParams(configPath)
+	if err != nil {
+		log.Printf("Failed to load config from %s, using defaults: %v", configPath, err)
+		params = config.DefaultModelParams()
+	}
 
-	hub := websocket.NewHub()
-	go hub.Run()
+	alertCh := make(chan alarm_websocket.AlertEvent, 256)
 
-	handler := handlers.NewHandler(repo, predictionSvc, topsisSvc, hub)
+	sensorRcv := sensor_receiver.NewSensorReceiver(repo, alertCh, params.Alarm)
+	predictor := weathering_predictor.NewWeatheringPredictor(repo, params.Prediction)
+	optimizer := material_optimizer.NewMaterialOptimizer(repo, params.Topsis)
+	alarmHub := alarm_websocket.NewHub(alertCh, repo, params.Alarm)
+
+	go alarmHub.Run()
 
 	r := mux.NewRouter()
-	handler.RegisterRoutes(r)
+
+	sensorRcv.RegisterRoutes(r)
+	predictor.RegisterRoutes(r)
+	optimizer.RegisterRoutes(r)
+	alarmHub.RegisterRoutes(r)
 
 	port := getEnv("PORT", "8080")
 	server := &http.Server{
@@ -78,21 +92,27 @@ func main() {
 	}
 
 	log.Printf("Server starting on port %s...", port)
+	log.Printf("Config loaded from: %s", configPath)
+	log.Printf("Modules: sensor_receiver | weathering_predictor | material_optimizer | alarm_websocket")
 	log.Printf("API endpoints:")
-	log.Printf("  GET    /api/sites")
-	log.Printf("  GET    /api/sites/{id}")
-	log.Printf("  GET    /api/sites/{id}/sensors")
-	log.Printf("  GET    /api/sites/{id}/data")
-	log.Printf("  GET    /api/sites/{id}/weathering-rates")
-	log.Printf("  GET    /api/sensors/{id}/hourly")
-	log.Printf("  POST   /api/data")
-	log.Printf("  GET    /api/alerts")
-	log.Printf("  PUT    /api/alerts/{id}/acknowledge")
-	log.Printf("  GET    /api/materials")
-	log.Printf("  POST   /api/predict")
-	log.Printf("  POST   /api/predict/batch")
-	log.Printf("  POST   /api/topsis")
-	log.Printf("  WS     /ws/alerts")
+	log.Printf("  [sensor_receiver]")
+	log.Printf("    GET    /api/sites")
+	log.Printf("    GET    /api/sites/{id}")
+	log.Printf("    GET    /api/sites/{id}/sensors")
+	log.Printf("    GET    /api/sites/{id}/data")
+	log.Printf("    GET    /api/sites/{id}/weathering-rates")
+	log.Printf("    GET    /api/sensors/{id}/hourly")
+	log.Printf("    POST   /api/data")
+	log.Printf("  [weathering_predictor]")
+	log.Printf("    POST   /api/predict")
+	log.Printf("    POST   /api/predict/batch")
+	log.Printf("  [material_optimizer]")
+	log.Printf("    GET    /api/materials")
+	log.Printf("    POST   /api/topsis")
+	log.Printf("  [alarm_websocket]")
+	log.Printf("    WS     /ws/alerts")
+	log.Printf("    GET    /api/alerts")
+	log.Printf("    PUT    /api/alerts/{id}/acknowledge")
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Failed to start server: %v", err)
