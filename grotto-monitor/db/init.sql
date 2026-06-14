@@ -156,3 +156,68 @@ SELECT add_continuous_aggregate_policy('monitoring_hourly',
     start_offset => INTERVAL '3 hours',
     end_offset => INTERVAL '1 hour',
     schedule_interval => INTERVAL '1 hour');
+
+ALTER TABLE monitoring_data SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'site_id, sensor_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+
+SELECT add_compression_policy('monitoring_data',
+    compress_after => INTERVAL '7 days',
+    schedule_interval => INTERVAL '1 day',
+    if_not_exists => TRUE
+);
+
+ALTER TABLE monitoring_data SET (
+    timescaledb.compress_chunk_time_interval = '1 day'
+);
+
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+ALTER SYSTEM SET shared_preload_libraries = 'timescaledb,pg_stat_statements';
+ALTER SYSTEM SET work_mem = '64MB';
+ALTER SYSTEM SET maintenance_work_mem = '512MB';
+ALTER SYSTEM SET effective_cache_size = '4GB';
+ALTER SYSTEM SET max_wal_size = '4GB';
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+
+CREATE INDEX IF NOT EXISTS idx_monitoring_data_time_sensor ON monitoring_data (time DESC, sensor_id);
+CREATE INDEX IF NOT EXISTS idx_monitoring_data_time_site ON monitoring_data (time DESC, site_id);
+
+CREATE OR REPLACE VIEW monitoring_summary AS
+SELECT
+    gs.id AS site_id,
+    gs.name AS site_name,
+    COUNT(DISTINCT s.id) AS sensor_count,
+    COUNT(md.*) AS total_records,
+    MIN(md.time) AS earliest_record,
+    MAX(md.time) AS latest_record
+FROM grotto_sites gs
+LEFT JOIN sensors s ON s.site_id = gs.id
+LEFT JOIN monitoring_data md ON md.site_id = gs.id
+GROUP BY gs.id, gs.name
+ORDER BY gs.id;
+
+CREATE OR REPLACE FUNCTION get_site_latest_data(p_site_id INT)
+RETURNS TABLE (
+    sensor_id INT,
+    sensor_code VARCHAR,
+    sensor_type VARCHAR,
+    latest_time TIMESTAMPTZ,
+    latest_value DOUBLE PRECISION
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT DISTINCT ON (s.id)
+        s.id,
+        s.sensor_code,
+        s.sensor_type,
+        md.time,
+        md.value
+    FROM sensors s
+    LEFT JOIN monitoring_data md ON md.sensor_id = s.id
+    WHERE s.site_id = p_site_id
+    ORDER BY s.id, md.time DESC;
+END;
+$$ LANGUAGE plpgsql;

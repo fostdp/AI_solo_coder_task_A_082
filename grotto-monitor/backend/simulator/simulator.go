@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -29,6 +30,30 @@ type MonitoringData struct {
 	SensorID int       `json:"sensor_id"`
 	SiteID   int       `json:"site_id"`
 	Value    float64   `json:"value"`
+}
+
+type InjectionRequest struct {
+	SensorID   *int       `json:"sensor_id,omitempty"`
+	SiteID     *int       `json:"site_id,omitempty"`
+	SensorType *string    `json:"sensor_type,omitempty"`
+	Value      float64    `json:"value"`
+	StartTime   *time.Time `json:"start_time,omitempty"`
+	EndTime     *time.Time `json:"end_time,omitempty"`
+	Duration    *string    `json:"duration,omitempty"`
+	Count       *int       `json:"count,omitempty"`
+}
+
+type SimulatorStatus struct {
+	Running         bool           `json:"running"`
+	IntervalHours   int            `json:"interval_hours"`
+	BackfillDays    int            `json:"backfill_days"`
+	APIBaseURL      string         `json:"api_base_url"`
+	SensorCount     int            `json:"sensor_count"`
+	SiteCount       int            `json:"site_count"`
+	TotalDataSent   int64          `json:"total_data_sent"`
+	LastReportTime  *time.Time     `json:"last_report_time,omitempty"`
+	InjectedValues  map[int]float64 `json:"injected_values,omitempty"`
+	Overrides       map[int]float64 `json:"overrides,omitempty"`
 }
 
 var sensors = []SensorConfig{
@@ -105,6 +130,15 @@ var hourlyWeatherData = []struct {
 	{23, -2.5, 3.5},
 }
 
+var (
+	mu               sync.RWMutex
+	totalDataSent    int64
+	lastReportTime   *time.Time
+	injectedValues   = make(map[int]float64)
+	valueOverrides   = make(map[int]float64)
+	simRunning       bool
+)
+
 func getEnv(key, defaultValue string) string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -137,7 +171,29 @@ func getEnvBool(key string, defaultValue bool) bool {
 	return boolValue
 }
 
+func getSensorByID(id int) *SensorConfig {
+	for i := range sensors {
+		if sensors[i].ID == id {
+			return &sensors[i]
+		}
+	}
+	return nil
+}
+
 func generateSensorValue(sensor *SensorConfig, hour int) float64 {
+	mu.RLock()
+	if override, ok := valueOverrides[sensor.ID]; ok {
+		mu.RUnlock()
+		return override
+	}
+	if injected, ok := injectedValues[sensor.ID]; ok {
+		mu.RUnlock()
+		sensor.CurrentValue = injected
+		delete(injectedValues, sensor.ID)
+		return injected
+	}
+	mu.RUnlock()
+
 	seasonalFactor := 1.0 + 0.3*math.Sin(2*math.Pi*float64(time.Now().YearDay())/365.25)
 
 	switch sensor.SensorType {
@@ -195,7 +251,8 @@ func sendData(apiURL string, data MonitoringData) error {
 		return fmt.Errorf("marshal data: %w", err)
 	}
 
-	resp, err := http.Post(apiURL+"/api/data", "application/json", bytes.NewBuffer(jsonData))
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(apiURL+"/api/data", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("post data: %w", err)
 	}
@@ -205,7 +262,43 @@ func sendData(apiURL string, data MonitoringData) error {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
+	mu.Lock()
+	totalDataSent++
+	mu.Unlock()
+
 	return nil
+}
+
+func reportData(apiURL string, dataTime time.Time) {
+	hour := dataTime.Hour()
+	count := 0
+
+	for j := range sensors {
+		sensor := &sensors[j]
+		value := generateSensorValue(sensor, hour)
+		sensor.CurrentValue = value
+
+		data := MonitoringData{
+			Time:     dataTime,
+			SensorID: sensor.ID,
+			SiteID:   sensor.SiteID,
+			Value:    value,
+		}
+
+		if err := sendData(apiURL, data); err != nil {
+			log.Printf("上报失败 [%s]: %v", sensor.SensorCode, err)
+		} else {
+			log.Printf("  ✓ %-20s = %8.3f", sensor.SensorCode, value)
+			count++
+		}
+	}
+
+	now := time.Now()
+	mu.Lock()
+	lastReportTime = &now
+	mu.Unlock()
+
+	log.Printf("本次上报完成: %d/%d 条数据成功", count, len(sensors))
 }
 
 func backfillHistoricalData(apiURL string, days int) {
@@ -244,6 +337,259 @@ func backfillHistoricalData(apiURL string, days int) {
 	log.Println("历史数据回灌完成")
 }
 
+func handleInject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req InjectionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	affected := 0
+	apiHost := getEnv("API_HOST", "localhost")
+	apiPort := getEnvInt("API_PORT", 8080)
+	apiURL := fmt.Sprintf("http://%s:%d", apiHost, apiPort)
+
+	var start, end time.Time
+	if req.StartTime != nil {
+		start = *req.StartTime
+	} else {
+		start = time.Now()
+	}
+
+	hoursToInject := 1
+	if req.Count != nil {
+		hoursToInject = *req.Count
+	} else if req.Duration != nil {
+		d, err := time.ParseDuration(*req.Duration)
+		if err == nil {
+			hoursToInject = int(d.Hours())
+		}
+	}
+	if hoursToInject < 1 {
+		hoursToInject = 1
+	}
+	if hoursToInject > 8760 {
+		hoursToInject = 8760
+	}
+
+	end = start.Add(time.Duration(hoursToInject) * time.Hour)
+
+	targetSensors := []*SensorConfig{}
+
+	for i := range sensors {
+		s := &sensors[i]
+		match := true
+
+		if req.SensorID != nil && *req.SensorID != s.ID {
+			match = false
+		}
+		if req.SiteID != nil && *req.SiteID != s.SiteID {
+			match = false
+		}
+		if req.SensorType != nil && *req.SensorType != s.SensorType {
+			match = false
+		}
+
+		if match {
+			targetSensors = append(targetSensors, s)
+		}
+	}
+
+	if len(targetSensors) == 0 {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        false,
+			"error":          "No sensors matched the specified criteria",
+			"affected_count": 0,
+		})
+		return
+	}
+
+	for t := start; t.Before(end); t = t.Add(time.Hour) {
+		hour := t.Hour()
+		for _, s := range targetSensors {
+			value := req.Value
+			value = math.Max(s.MinValue, math.Min(s.MaxValue, value))
+			s.CurrentValue = value
+
+			data := MonitoringData{
+				Time:     t,
+				SensorID: s.ID,
+				SiteID:   s.SiteID,
+				Value:    value,
+			}
+
+			if err := sendData(apiURL, data); err != nil {
+				log.Printf("注入数据失败 [%s]: %v", s.SensorCode, err)
+			} else {
+				affected++
+			}
+		}
+	}
+
+	log.Printf("数据注入完成: 注入 %d 条数据, 涉及 %d 个传感器", affected, len(targetSensors))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":        true,
+		"affected_count": affected,
+		"sensor_count":   len(targetSensors),
+		"time_range": map[string]time.Time{
+			"start": start,
+			"end":   end,
+		},
+	})
+}
+
+func handleOverride(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		SensorID   *int     `json:"sensor_id,omitempty"`
+		SiteID     *int     `json:"site_id,omitempty"`
+		SensorType *string  `json:"sensor_type,omitempty"`
+		Value      *float64 `json:"value,omitempty"`
+		Reset      bool     `json:"reset,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	affected := 0
+	mu.Lock()
+	defer mu.Unlock()
+
+	if req.Reset {
+		if req.SensorID != nil {
+			delete(valueOverrides, *req.SensorID)
+			affected = 1
+		} else if req.SiteID != nil || req.SensorType != nil {
+			for i := range sensors {
+				s := &sensors[i]
+				match := true
+				if req.SiteID != nil && *req.SiteID != s.SiteID {
+					match = false
+				}
+				if req.SensorType != nil && *req.SensorType != s.SensorType {
+					match = false
+				}
+				if match {
+					delete(valueOverrides, s.ID)
+					affected++
+				}
+			}
+		} else {
+			valueOverrides = make(map[int]float64)
+			affected = len(sensors)
+		}
+	} else if req.Value != nil {
+		for i := range sensors {
+			s := &sensors[i]
+			match := true
+			if req.SensorID != nil && *req.SensorID != s.ID {
+				match = false
+			}
+			if req.SiteID != nil && *req.SiteID != s.SiteID {
+				match = false
+			}
+			if req.SensorType != nil && *req.SensorType != s.SensorType {
+				match = false
+			}
+			if match {
+				value := *req.Value
+				value = math.Max(s.MinValue, math.Min(s.MaxValue, value))
+				valueOverrides[s.ID] = value
+				affected++
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":        true,
+		"affected_count": affected,
+		"reset":          req.Reset,
+	})
+}
+
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	siteCount := make(map[int]bool)
+	for _, s := range sensors {
+		siteCount[s.SiteID] = true
+	}
+
+	apiHost := getEnv("API_HOST", "localhost")
+	apiPort := getEnvInt("API_PORT", 8080)
+	apiURL := fmt.Sprintf("http://%s:%d", apiHost, apiPort)
+
+	status := SimulatorStatus{
+		Running:        simRunning,
+		IntervalHours:  getEnvInt("INTERVAL_HOURS", 1),
+		BackfillDays:   getEnvInt("BACKFILL_DAYS", 30),
+		APIBaseURL:     apiURL,
+		SensorCount:    len(sensors),
+		SiteCount:      len(siteCount),
+		TotalDataSent:  totalDataSent,
+		LastReportTime: lastReportTime,
+		InjectedValues: make(map[int]float64),
+		Overrides:      make(map[int]float64),
+	}
+
+	for k, v := range injectedValues {
+		status.InjectedValues[k] = v
+	}
+	for k, v := range valueOverrides {
+		status.Overrides[k] = v
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+func handleSensors(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(sensors)
+}
+
+func startControlServer() {
+	controlPort := getEnvInt("CONTROL_PORT", 8081)
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/inject", handleInject)
+	mux.HandleFunc("/override", handleOverride)
+	mux.HandleFunc("/status", handleStatus)
+	mux.HandleFunc("/sensors", handleSensors)
+
+	log.Printf("模拟器控制服务启动，监听端口 %d", controlPort)
+	log.Printf("控制API:")
+	log.Printf("  POST /inject     - 注入温湿度/风化数据")
+	log.Printf("  POST /override   - 设置/重置传感器值覆盖")
+	log.Printf("  GET  /status     - 获取模拟器状态")
+	log.Printf("  GET  /sensors    - 获取传感器列表")
+
+	server := &http.Server{
+		Addr:         ":" + strconv.Itoa(controlPort),
+		Handler:      mux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("控制服务启动失败: %v", err)
+	}
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
@@ -254,19 +600,51 @@ func main() {
 	backfillDays := getEnvInt("BACKFILL_DAYS", 30)
 	shouldBackfill := getEnvBool("BACKFILL", true)
 
+	go startControlServer()
+
 	log.Println("========================================")
 	log.Println("石窟监测传感器模拟器启动")
 	log.Println("========================================")
 	log.Printf("API 地址: %s", apiURL)
 	log.Printf("上报间隔: %d 小时", intervalHours)
 	log.Printf("回灌天数: %d 天", backfillDays)
+
+	siteCount := make(map[int]bool)
+	for _, s := range sensors {
+		siteCount[s.SiteID] = true
+	}
+	log.Printf("石窟群数量: %d", len(siteCount))
 	log.Printf("传感器数量: %d", len(sensors))
+	log.Println("========================================")
+	log.Println("石窟群列表:")
+	siteMap := map[int]string{
+		1: "敦煌莫高窟",
+		2: "云冈石窟",
+		3: "龙门石窟",
+		4: "麦积山石窟",
+		5: "大足石刻",
+		6: "响堂山石窟",
+		7: "巩义石窟",
+		8: "炳灵寺石窟",
+		9: "克孜尔石窟",
+		10: "须弥山石窟",
+	}
+	for id, name := range siteMap {
+		sensorCount := 0
+		for _, s := range sensors {
+			if s.SiteID == id {
+				sensorCount++
+			}
+		}
+		log.Printf("  [%2d] %-15s 传感器数: %d", id, name, sensorCount)
+	}
 	log.Println("========================================")
 
 	if shouldBackfill {
 		backfillHistoricalData(apiURL, backfillDays)
 	}
 
+	simRunning = true
 	log.Println("开始实时数据上报...")
 
 	ticker := time.NewTicker(time.Duration(intervalHours) * time.Hour)
@@ -274,29 +652,8 @@ func main() {
 
 	for range ticker.C {
 		now := time.Now()
-		hour := now.Hour()
-
 		log.Printf("[%s] 开始上报数据...", now.Format("2006-01-02 15:04:05"))
-
-		for j := range sensors {
-			sensor := &sensors[j]
-			value := generateSensorValue(sensor, hour)
-			sensor.CurrentValue = value
-
-			data := MonitoringData{
-				Time:     now,
-				SensorID: sensor.ID,
-				SiteID:   sensor.SiteID,
-				Value:    value,
-			}
-
-			if err := sendData(apiURL, data); err != nil {
-				log.Printf("上报失败 [%s]: %v", sensor.SensorCode, err)
-			} else {
-				log.Printf("  ✓ %-20s = %8.3f", sensor.SensorCode, value)
-			}
-		}
-
+		reportData(apiURL, now)
 		log.Printf("上报完成，等待 %d 小时后下次上报...", intervalHours)
 		log.Println("----------------------------------------")
 	}
